@@ -1,0 +1,10 @@
+.git/
+__pycache__/
+*.py[cod]
+
+.env
+.env.*
+!.env.example
+
+apps/*/agents.json
+apps/*/spool/

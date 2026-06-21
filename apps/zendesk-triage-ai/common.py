@@ -1,0 +1,457 @@
+"""共通基盤: 設定・スプール管理・Zendesk クライアント。
+
+安全設計(spec §6)に従い、このモジュールの Zendesk 書き込み操作は
+`post_internal_note`(内部メモ追記 + タグ付与)のみを提供する。
+クローズ / アサイン変更 / 公開返信を行う関数は実装しない。
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+import tempfile
+import time
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import requests
+
+# --------------------------------------------------------------------------
+# 設定(すべて環境変数経由。秘密情報はコードに直書きしない — spec §6-7)
+# --------------------------------------------------------------------------
+
+# スプールの既定値はこのリポジトリ配下(spool)。
+_DEFAULT_SPOOL = Path(__file__).resolve().parent / "spool"
+SPOOL_DIR = Path(os.environ.get("TRIAGE_SPOOL_DIR", str(_DEFAULT_SPOOL)))
+
+ZENDESK_URL = os.environ.get("ZENDESK_URL", "").rstrip("/")
+ZENDESK_EMAIL = os.environ.get("ZENDESK_EMAIL", "")
+# API トークン(値はログに出さない)
+_ZENDESK_KEY = os.environ.get("ZENDESK_KEY", "")
+
+SPOOL_SUBDIRS = ("incoming", "tmp", "pending", "done", "failed", "state")
+
+# 担当割り当て名簿(SPEC_ASSIGNMENT.md §5)。秘密情報ではないが運用で頻繁に変わるため
+# 設定ファイルで持つ(コード直書きしない)。既定は agents.json。
+AGENTS_FILE = Path(os.environ.get("TRIAGE_AGENTS_FILE", str(Path(__file__).resolve().parent / "agents.json")))
+
+HTTP_TIMEOUT = float(os.environ.get("TRIAGE_HTTP_TIMEOUT", "30"))
+LIGHT_AGENT_ROLE_TYPE = int(os.environ.get("TRIAGE_LIGHT_AGENT_ROLE_TYPE", "1"))
+INCLUDE_SUSPENDED_AGENTS = os.environ.get("TRIAGE_INCLUDE_SUSPENDED_AGENTS", "").lower() in ("1", "true", "yes")
+AGENTS_TEMPLATE_FILE = Path(os.environ.get(
+    "TRIAGE_AGENTS_TEMPLATE_FILE",
+    str(Path(__file__).resolve().parent / "agents.example.json"),
+))
+
+
+def log(*args: Any) -> None:
+    """stderr へのタイムスタンプ付きログ。秘密情報は渡さないこと。"""
+    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}]", *args, file=sys.stderr, flush=True)
+
+
+# --------------------------------------------------------------------------
+# スプール管理(spec §3)
+# --------------------------------------------------------------------------
+
+def ensure_spool_dirs(base: Optional[Path] = None) -> Path:
+    """スプールの全サブディレクトリを作成し、ベースパスを返す。"""
+    base = Path(base) if base is not None else SPOOL_DIR
+    for sub in SPOOL_SUBDIRS:
+        (base / sub).mkdir(parents=True, exist_ok=True)
+    return base
+
+
+def spool_path(subdir: str, base: Optional[Path] = None) -> Path:
+    base = Path(base) if base is not None else SPOOL_DIR
+    if subdir not in SPOOL_SUBDIRS:
+        raise ValueError(f"unknown spool subdir: {subdir}")
+    return base / subdir
+
+
+def atomic_write_json(target: Path, data: Dict[str, Any], *, base: Optional[Path] = None) -> Path:
+    """tmp/ に書いてから os.rename() で目的ディレクトリへアトミックに移す(spec §3 鉄則)。
+
+    目的ディレクトリへ直接書かない。書きかけファイルを他プロセスが拾わないことを保証する。
+    """
+    base = Path(base) if base is not None else SPOOL_DIR
+    target = Path(target)
+    tmp_dir = base / "tmp"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    fd, tmp_name = tempfile.mkstemp(prefix=target.stem + "_", suffix=".tmp", dir=str(tmp_dir))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            # 日本語はそのまま保存(spec §4 LLM 仕様)
+            json.dump(data, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.rename(tmp_name, target)  # 同一 FS 上のアトミック rename
+    except Exception:
+        # 失敗時は tmp を残さない
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+    return target
+
+
+def move_to(src: Path, subdir: str, *, base: Optional[Path] = None) -> Path:
+    """既存ファイルをスプール内の別サブディレクトリへアトミックに移す。"""
+    base = Path(base) if base is not None else SPOOL_DIR
+    src = Path(src)
+    dest_dir = spool_path(subdir, base=base)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = dest_dir / src.name
+    os.rename(src, dest)
+    return dest
+
+
+def read_json(path: Path) -> Dict[str, Any]:
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def atomic_write_json_same_dir(target: Path, data: Dict[str, Any]) -> Path:
+    """任意の JSON ファイルを同じディレクトリ内の tmp 経由で atomic に更新する。"""
+    target = Path(target)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=target.stem + "_", suffix=".tmp", dir=str(target.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.rename(tmp_name, target)
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+    return target
+
+
+# --------------------------------------------------------------------------
+# Zendesk クライアント
+# --------------------------------------------------------------------------
+
+def _zd_auth():
+    """API トークン認証: (email/token, api_token)。"""
+    if not ZENDESK_URL:
+        raise RuntimeError("ZENDESK_URL が未設定です")
+    if not ZENDESK_EMAIL or not _ZENDESK_KEY:
+        raise RuntimeError("ZENDESK_EMAIL / ZENDESK_KEY が未設定です")
+    return (f"{ZENDESK_EMAIL}/token", _ZENDESK_KEY)
+
+
+def zd_request(method: str, path: str, *, params: Optional[dict] = None,
+               json_body: Optional[dict] = None) -> Dict[str, Any]:
+    """Zendesk REST API への薄いラッパ。path は '/api/v2/...' で渡す。"""
+    url = ZENDESK_URL + path if path.startswith("/") else f"{ZENDESK_URL}/{path}"
+    resp = requests.request(
+        method.upper(), url,
+        auth=_zd_auth(),
+        params=params,
+        json=json_body,
+        headers={"Content-Type": "application/json", "Accept": "application/json"},
+        timeout=HTTP_TIMEOUT,
+    )
+    if not resp.ok:
+        # ボディに秘密情報は含まれない想定だが、念のため短縮
+        raise RuntimeError(f"Zendesk {method} {path} -> {resp.status_code}: {resp.text[:500]}")
+    if resp.status_code == 204 or not resp.content:
+        return {}
+    return resp.json()
+
+
+def search_tickets(query: str) -> List[Dict[str, Any]]:
+    """Search API。読み取り専用。"""
+    out: List[Dict[str, Any]] = []
+    params = {"query": query}
+    path = "/api/v2/search.json"
+    while True:
+        data = zd_request("GET", path, params=params)
+        out.extend(data.get("results", []))
+        next_page = data.get("next_page")
+        if not next_page:
+            break
+        # next_page はフル URL。path/params をそれに差し替える
+        path = next_page[len(ZENDESK_URL):] if next_page.startswith(ZENDESK_URL) else next_page
+        params = None
+    return out
+
+
+def fetch_ticket_comments(ticket_id: int) -> List[Dict[str, Any]]:
+    """チケットのコメントを取得(読み取り専用)。
+
+    audit ではなく Comments API を使う(audit の metadata には IP 等が含まれるため — spec §5)。
+    """
+    out: List[Dict[str, Any]] = []
+    path = f"/api/v2/tickets/{ticket_id}/comments.json"
+    params: Optional[dict] = {}
+    while True:
+        data = zd_request("GET", path, params=params)
+        out.extend(data.get("comments", []))
+        next_page = data.get("next_page")
+        if not next_page:
+            break
+        path = next_page[len(ZENDESK_URL):] if next_page.startswith(ZENDESK_URL) else next_page
+        params = None
+    return out
+
+
+def fetch_ticket(ticket_id: int) -> Dict[str, Any]:
+    """チケット本体(subject 等)を取得。読み取り専用。"""
+    return zd_request("GET", f"/api/v2/tickets/{ticket_id}.json").get("ticket", {})
+
+
+def zendesk_healthcheck() -> Dict[str, Any]:
+    """Zendesk API token の疎通確認。"""
+    return zd_request("GET", "/api/v2/users/me.json").get("user", {})
+
+
+def list_users(*, role: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Zendesk users をページングして取得する。"""
+    out: List[Dict[str, Any]] = []
+    params: Optional[dict] = {"role[]": role} if role else {}
+    path = "/api/v2/users.json"
+    while True:
+        data = zd_request("GET", path, params=params)
+        out.extend(data.get("users", []))
+        next_page = data.get("next_page")
+        if not next_page:
+            break
+        path = next_page[len(ZENDESK_URL):] if next_page.startswith(ZENDESK_URL) else next_page
+        params = None
+    return out
+
+
+# --------------------------------------------------------------------------
+# 担当割り当て: 名簿・輪番状態・担当者フィールド書込(SPEC_ASSIGNMENT.md §5, §9)
+# --------------------------------------------------------------------------
+
+_agents_cache: Optional[Dict[str, Any]] = None
+
+
+def ensure_agents_file() -> Path:
+    """agents.json が無ければテンプレートから初期生成する。"""
+    if AGENTS_FILE.exists():
+        return AGENTS_FILE
+    AGENTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    if AGENTS_TEMPLATE_FILE.exists():
+        loaded = read_json(AGENTS_TEMPLATE_FILE)
+    else:
+        loaded = {
+            "_note": "Auto-generated initial agents config.",
+            "assignee_field_id": None,
+            "escalation_map": {
+                "scheduler": None,
+                "storage": None,
+                "network": None,
+                "software": None,
+                "ondemand": None,
+                "account": None,
+                "other": None,
+            },
+            "light_agents": [],
+        }
+    atomic_write_json_same_dir(AGENTS_FILE, loaded)
+    return AGENTS_FILE
+
+
+def _norm_name(value: Any) -> str:
+    return " ".join(str(value or "").strip().lower().split())
+
+
+def _agent_lookup(light_agents: List[Dict[str, Any]]) -> Dict[str, int]:
+    lookup: Dict[str, int] = {}
+    for agent in light_agents:
+        aid = agent.get("id")
+        if aid is None:
+            continue
+        for key in ("name", "email", "alias"):
+            normalized = _norm_name(agent.get(key))
+            if normalized:
+                lookup[normalized] = int(aid)
+    return lookup
+
+
+def resolve_escalation_map(raw_map: Dict[str, Any], light_agents: List[Dict[str, Any]]) -> Tuple[Dict[str, Any], List[str]]:
+    """人名/email/id 混在の escalation_map を Zendesk user id に解決する。"""
+    lookup = _agent_lookup(light_agents)
+    resolved: Dict[str, Any] = {}
+    errors: List[str] = []
+
+    def resolve_one(category: str, value: Any) -> Optional[int]:
+        if value is None or value == "":
+            return None
+        if isinstance(value, int):
+            return value
+        if isinstance(value, str):
+            normalized = _norm_name(value)
+            if normalized.isdigit():
+                return int(normalized)
+            if normalized in lookup:
+                return lookup[normalized]
+            errors.append(f"{category}: {value!r} を light_agents から解決できません")
+            return None
+        errors.append(f"{category}: unsupported escalation value {value!r}")
+        return None
+
+    for category, spec in (raw_map or {}).items():
+        if isinstance(spec, list):
+            ids = [aid for aid in (resolve_one(category, item) for item in spec) if aid is not None]
+            resolved[category] = ids or None
+        else:
+            resolved[category] = resolve_one(category, spec)
+    return resolved, errors
+
+
+def load_agents_config(*, refresh: bool = False) -> Dict[str, Any]:
+    """名簿(agents.json)を読む。
+
+    返す dict: {assignee_field_id, light_agents:[{id,name,email}], escalation_map:{category:id|null}}。
+    ファイルが無い/壊れている場合は安全な空設定を返す(機能は無効化され、メモ投稿は従来どおり)。
+    """
+    global _agents_cache
+    if _agents_cache is not None and not refresh:
+        return _agents_cache
+    cfg: Dict[str, Any] = {"assignee_field_id": None, "light_agents": [], "escalation_map": {}}
+    try:
+        if AGENTS_FILE.exists():
+            loaded = read_json(AGENTS_FILE)
+            cfg["assignee_field_id"] = loaded.get("assignee_field_id")
+            cfg["light_agents"] = loaded.get("light_agents") or []
+            raw_map = loaded.get("escalation_map") or {}
+            cfg["escalation_map_raw"] = raw_map
+            cfg["escalation_map"], errors = resolve_escalation_map(raw_map, cfg["light_agents"])
+            if errors:
+                cfg["escalation_errors"] = errors
+                for err in errors:
+                    log(f"escalation_map 解決警告: {err}")
+    except Exception as e:  # noqa: BLE001
+        log(f"agents.json 読込失敗(担当割り当てを無効化): {e}")
+    _agents_cache = cfg
+    return cfg
+
+
+def fetch_light_agents() -> List[Dict[str, Any]]:
+    """Zendesk から現在のライトエージェント一覧を取得する。"""
+    users = list_users(role="agent")
+    agents: List[Dict[str, Any]] = []
+    for user in users:
+        if user.get("role_type") != LIGHT_AGENT_ROLE_TYPE:
+            continue
+        if not INCLUDE_SUSPENDED_AGENTS and user.get("suspended"):
+            continue
+        agents.append({
+            "id": int(user["id"]),
+            "name": user.get("name") or str(user["id"]),
+            "email": user.get("email"),
+            "alias": user.get("alias"),
+            "role_type": user.get("role_type"),
+        })
+    agents.sort(key=lambda a: (_norm_name(a.get("name")), int(a["id"])))
+    return agents
+
+
+def sync_agents_config(*, dry_run: bool = False) -> Dict[str, Any]:
+    """agents.json の light_agents を Zendesk の現在値で更新する。
+
+    escalation_map は人間が管理するため保持する。人名指定が現在の light_agents で
+    解決できるかも検証し、解決後の設定を返す。
+    """
+    loaded: Dict[str, Any] = {}
+    if AGENTS_FILE.exists():
+        loaded = read_json(AGENTS_FILE)
+    loaded.setdefault("assignee_field_id", None)
+    loaded.setdefault("escalation_map", {})
+    loaded["light_agents"] = fetch_light_agents()
+    resolved, errors = resolve_escalation_map(loaded.get("escalation_map") or {}, loaded["light_agents"])
+    loaded["_sync"] = {
+        "source": "zendesk",
+        "synced_at": int(time.time()),
+        "light_agent_count": len(loaded["light_agents"]),
+        "unresolved_escalations": errors,
+    }
+    if not dry_run:
+        atomic_write_json_same_dir(AGENTS_FILE, loaded)
+        load_agents_config(refresh=True)
+    return {
+        "assignee_field_id": loaded.get("assignee_field_id"),
+        "light_agents": loaded["light_agents"],
+        "escalation_map": resolved,
+        "escalation_map_raw": loaded.get("escalation_map") or {},
+        "escalation_errors": errors,
+    }
+
+
+def light_agent_ids() -> set:
+    """書き込み可能 ID の allowlist(LIGHT_AGENTS の id 集合)。"""
+    return {a["id"] for a in load_agents_config().get("light_agents", []) if "id" in a}
+
+
+def agent_name(agent_id: int) -> str:
+    for a in load_agents_config().get("light_agents", []):
+        if a.get("id") == agent_id:
+            return a.get("name", str(agent_id))
+    return str(agent_id)
+
+
+def _roundrobin_path(base: Optional[Path] = None) -> Path:
+    base = Path(base) if base is not None else SPOOL_DIR
+    return base / "state" / "roundrobin.json"
+
+
+def read_roundrobin(*, base: Optional[Path] = None) -> int:
+    """輪番カーソルを読む。未初期化なら 0。"""
+    p = _roundrobin_path(base)
+    try:
+        return int(read_json(p).get("cursor", 0))
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def write_roundrobin(cursor: int, *, base: Optional[Path] = None) -> None:
+    """輪番カーソルを atomic に書く(tmp→rename)。"""
+    base = Path(base) if base is not None else SPOOL_DIR
+    atomic_write_json(_roundrobin_path(base), {"cursor": int(cursor)}, base=base)
+
+
+def set_assignee_field(ticket_id: int, agent_id: int) -> Dict[str, Any]:
+    """カスタムフィールド「担当者」にライトエージェント ID をセットする。
+
+    SPEC_ASSIGNMENT.md §6-2 の例外的な 2 つ目の書き込み操作。
+    assignee(標準の担当者)変更・クローズ・公開返信は依然として行わない。
+    書き込む値は呼び出し側で allowlist 検証済みのライトエージェント ID であることを前提とする。
+    ASSIGNEE_FIELD_ID(=agents.json の assignee_field_id)未設定なら書き込まない。
+    """
+    field_id = load_agents_config().get("assignee_field_id")
+    if not field_id:
+        raise RuntimeError("assignee_field_id が未設定です(Zendesk にカスタムフィールド『担当者』を作成して設定する)")
+    return zd_request(
+        "PUT", f"/api/v2/tickets/{ticket_id}.json",
+        json_body={"ticket": {"custom_fields": [{"id": field_id, "value": agent_id}]}},
+    )
+
+
+def post_internal_note(ticket_id: int, body: str, tags: Optional[List[str]] = None) -> Dict[str, Any]:
+    """当該チケットへ内部メモ(public:false)を追記し、タグを付与する。
+
+    spec §6: クローズ/アサイン/公開返信は行わない。
+    """
+    comment: Dict[str, Any] = {"body": body, "public": False}
+    result = zd_request(
+        "PUT", f"/api/v2/tickets/{ticket_id}.json",
+        json_body={"ticket": {"comment": comment}},
+    )
+    if tags:
+        # Tags API への POST は既存タグを保持したままマージ追加する
+        # (ticket update の additional_tags はこのエンドポイントでは反映されない)
+        zd_request("POST", f"/api/v2/tickets/{ticket_id}/tags.json",
+                   json_body={"tags": list(tags)})
+    return result

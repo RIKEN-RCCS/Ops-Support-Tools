@@ -1,0 +1,23 @@
+{
+  "_note": "Copy this to agents.json. light_agents is managed by sync_agents.py / poster.py. Keep agents.json out of git.",
+  "assignee_field_id": null,
+  "escalation_map": {
+    "scheduler": null,
+    "storage": null,
+    "network": null,
+    "software": null,
+    "ondemand": null,
+    "account": null,
+    "other": null
+  },
+  "light_agents": [
+    {
+      "id": 1001,
+      "name": "Example Agent A"
+    },
+    {
+      "id": 1002,
+      "name": "Example Agent B"
+    }
+  ]
+}

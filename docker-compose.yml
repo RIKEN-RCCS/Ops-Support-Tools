@@ -1,0 +1,33 @@
+services:
+  webhook:
+    build: ./apps/zendesk-triage-ai
+    command: ["python", "webhook.py", "--host", "0.0.0.0", "--port", "8080"]
+    env_file: .env
+    ports:
+      - "8080:8080"
+    volumes:
+      - triage-spool:/data/spool
+      - triage-config:/config
+    restart: unless-stopped
+
+  generator:
+    build: ./apps/zendesk-triage-ai
+    command: ["python", "generator.py", "-v", "--interval", "30"]
+    env_file: .env
+    volumes:
+      - triage-spool:/data/spool
+      - triage-config:/config
+    restart: unless-stopped
+
+  poster:
+    build: ./apps/zendesk-triage-ai
+    command: ["python", "poster.py", "-v", "--interval", "30"]
+    env_file: .env
+    volumes:
+      - triage-spool:/data/spool
+      - triage-config:/config
+    restart: unless-stopped
+
+volumes:
+  triage-spool:
+  triage-config:
