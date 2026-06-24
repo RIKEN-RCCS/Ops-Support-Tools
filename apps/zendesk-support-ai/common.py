@@ -9,13 +9,19 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import sys
 import tempfile
 import time
+from dataclasses import dataclass
+from fnmatch import fnmatch
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
+
+from secret_config import env_secret
+import spool_crypto
 
 # --------------------------------------------------------------------------
 # 設定(すべて環境変数経由。秘密情報はコードに直書きしない — spec §6-7)
@@ -23,26 +29,37 @@ import requests
 
 # スプールの既定値はこのリポジトリ配下(spool)。
 _DEFAULT_SPOOL = Path(__file__).resolve().parent / "spool"
-SPOOL_DIR = Path(os.environ.get("TRIAGE_SPOOL_DIR", str(_DEFAULT_SPOOL)))
+SPOOL_DIR = Path(os.environ.get("SUPPORT_AI_QUEUE_DIR", str(_DEFAULT_SPOOL)))
+QUEUE_DB = Path(os.environ.get("SUPPORT_AI_QUEUE_DB", str(SPOOL_DIR / "queue.sqlite")))
 
 ZENDESK_URL = os.environ.get("ZENDESK_URL", "").rstrip("/")
 ZENDESK_EMAIL = os.environ.get("ZENDESK_EMAIL", "")
-# API トークン(値はログに出さない)
-_ZENDESK_KEY = os.environ.get("ZENDESK_KEY", "")
+# API トークン(値はログに出さない)。本番では ZENDESK_KEY_FILE を使う。
+_ZENDESK_KEY = env_secret("ZENDESK_KEY")
 
-SPOOL_SUBDIRS = ("incoming", "tmp", "pending", "done", "failed", "state")
+SPOOL_SUBDIRS = (
+    "incoming",
+    "incoming_followup",
+    "pending",
+    "pending_followup",
+    "tmp",
+    "done",
+    "failed",
+    "state",
+)
 
 # 担当割り当て名簿(SPEC_ASSIGNMENT.md §5)。秘密情報ではないが運用で頻繁に変わるため
 # 設定ファイルで持つ(コード直書きしない)。既定は agents.json。
-AGENTS_FILE = Path(os.environ.get("TRIAGE_AGENTS_FILE", str(Path(__file__).resolve().parent / "agents.json")))
+AGENTS_FILE = Path(os.environ.get("SUPPORT_AI_AGENTS_FILE", str(Path(__file__).resolve().parent / "agents.json")))
 
-HTTP_TIMEOUT = float(os.environ.get("TRIAGE_HTTP_TIMEOUT", "30"))
-LIGHT_AGENT_ROLE_TYPE = int(os.environ.get("TRIAGE_LIGHT_AGENT_ROLE_TYPE", "1"))
-INCLUDE_SUSPENDED_AGENTS = os.environ.get("TRIAGE_INCLUDE_SUSPENDED_AGENTS", "").lower() in ("1", "true", "yes")
+HTTP_TIMEOUT = float(os.environ.get("SUPPORT_AI_HTTP_TIMEOUT", "30"))
+LIGHT_AGENT_ROLE_TYPE = int(os.environ.get("SUPPORT_AI_LIGHT_AGENT_ROLE_TYPE", "1"))
+INCLUDE_SUSPENDED_AGENTS = os.environ.get("SUPPORT_AI_INCLUDE_SUSPENDED_AGENTS", "").lower() in ("1", "true", "yes")
 AGENTS_TEMPLATE_FILE = Path(os.environ.get(
-    "TRIAGE_AGENTS_TEMPLATE_FILE",
+    "SUPPORT_AI_AGENTS_TEMPLATE_FILE",
     str(Path(__file__).resolve().parent / "agents.example.json"),
 ))
+ASSIGNEE_FIELD_ID_ENV = os.environ.get("SUPPORT_AI_ASSIGNEE_FIELD_ID", "").strip()
 
 
 def log(*args: Any) -> None:
@@ -51,14 +68,64 @@ def log(*args: Any) -> None:
 
 
 # --------------------------------------------------------------------------
-# スプール管理(spec §3)
+# SQLite キュー / レガシースプール管理(spec §3)
 # --------------------------------------------------------------------------
 
+@dataclass(frozen=True)
+class QueueItem:
+    queue: str
+    name: str
+
+    def unlink(self) -> None:
+        delete_queue_item(self)
+
+
+def _queue_conn() -> sqlite3.Connection:
+    QUEUE_DB.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(QUEUE_DB)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    return conn
+
+
+def _init_queue_db() -> None:
+    with _queue_conn() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS queue_items (
+              queue TEXT NOT NULL,
+              name TEXT NOT NULL,
+              payload_json TEXT NOT NULL,
+              created_at INTEGER NOT NULL,
+              updated_at INTEGER NOT NULL,
+              PRIMARY KEY (queue, name)
+            )
+            """
+        )
+
+
+def _encode_queue_payload(data: Dict[str, Any]) -> str:
+    key = spool_crypto.load_key()
+    payload = spool_crypto.encrypt_json(data, key=key) if key else data
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+
+def _decode_queue_payload(raw: str) -> Dict[str, Any]:
+    data = json.loads(raw)
+    if spool_crypto.is_encrypted_json(data):
+        key = spool_crypto.load_key()
+        if not key:
+            raise RuntimeError("queue payload is encrypted but SUPPORT_AI_QUEUE_KEY is not configured")
+        return spool_crypto.decrypt_json(data, key=key)
+    return data
+
+
 def ensure_spool_dirs(base: Optional[Path] = None) -> Path:
-    """スプールの全サブディレクトリを作成し、ベースパスを返す。"""
+    """レガシースプールの全サブディレクトリと SQLite キューを作成し、ベースパスを返す。"""
     base = Path(base) if base is not None else SPOOL_DIR
     for sub in SPOOL_SUBDIRS:
         (base / sub).mkdir(parents=True, exist_ok=True)
+    _init_queue_db()
     return base
 
 
@@ -69,13 +136,109 @@ def spool_path(subdir: str, base: Optional[Path] = None) -> Path:
     return base / subdir
 
 
-def atomic_write_json(target: Path, data: Dict[str, Any], *, base: Optional[Path] = None) -> Path:
+def _queue_for_target(target: Path, *, base: Path) -> Optional[str]:
+    target_parent = target.parent.resolve()
+    base_resolved = base.resolve()
+    for subdir in SPOOL_SUBDIRS:
+        if target_parent == (base_resolved / subdir):
+            return subdir
+    return None
+
+
+def queue_exists(queue: str, name: str) -> bool:
+    _init_queue_db()
+    with _queue_conn() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM queue_items WHERE queue = ? AND name = ?",
+            (queue, name),
+        ).fetchone()
+    return row is not None
+
+
+def write_queue_item(queue: str, name: str, data: Dict[str, Any]) -> QueueItem:
+    if queue not in SPOOL_SUBDIRS:
+        raise ValueError(f"unknown queue: {queue}")
+    _init_queue_db()
+    now = int(time.time())
+    with _queue_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO queue_items (queue, name, payload_json, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (queue, name, _encode_queue_payload(data), now, now),
+        )
+    return QueueItem(queue=queue, name=name)
+
+
+def read_queue_item(item: QueueItem) -> Dict[str, Any]:
+    _init_queue_db()
+    with _queue_conn() as conn:
+        row = conn.execute(
+            "SELECT payload_json FROM queue_items WHERE queue = ? AND name = ?",
+            (item.queue, item.name),
+        ).fetchone()
+    if not row:
+        raise FileNotFoundError(f"queue item not found: {item.queue}/{item.name}")
+    return _decode_queue_payload(row["payload_json"])
+
+
+def list_queue(queue: str, pattern: str = "*.json") -> List[QueueItem | Path]:
+    if queue not in SPOOL_SUBDIRS:
+        raise ValueError(f"unknown queue: {queue}")
+    _init_queue_db()
+    with _queue_conn() as conn:
+        rows = conn.execute(
+            "SELECT name FROM queue_items WHERE queue = ? ORDER BY created_at ASC, name ASC",
+            (queue,),
+        ).fetchall()
+    items: List[QueueItem | Path] = [
+        QueueItem(queue=queue, name=row["name"]) for row in rows if fnmatch(row["name"], pattern)
+    ]
+    queued_names = {item.name for item in items if isinstance(item, QueueItem)}
+    legacy_dir = spool_path(queue)
+    if legacy_dir.exists():
+        items.extend(path for path in sorted(legacy_dir.glob(pattern)) if path.name not in queued_names)
+    return items
+
+
+def delete_queue_item(item: QueueItem) -> None:
+    _init_queue_db()
+    with _queue_conn() as conn:
+        conn.execute(
+            "DELETE FROM queue_items WHERE queue = ? AND name = ?",
+            (item.queue, item.name),
+        )
+
+
+def move_queue_item(item: QueueItem, queue: str) -> QueueItem:
+    if queue not in SPOOL_SUBDIRS:
+        raise ValueError(f"unknown queue: {queue}")
+    _init_queue_db()
+    now = int(time.time())
+    with _queue_conn() as conn:
+        conn.execute(
+            """
+            UPDATE queue_items
+            SET queue = ?, updated_at = ?
+            WHERE queue = ? AND name = ?
+            """,
+            (queue, now, item.queue, item.name),
+        )
+    return QueueItem(queue=queue, name=item.name)
+
+
+def atomic_write_json(target: Path, data: Dict[str, Any], *, base: Optional[Path] = None) -> Path | QueueItem:
     """tmp/ に書いてから os.rename() で目的ディレクトリへアトミックに移す(spec §3 鉄則)。
 
     目的ディレクトリへ直接書かない。書きかけファイルを他プロセスが拾わないことを保証する。
     """
     base = Path(base) if base is not None else SPOOL_DIR
     target = Path(target)
+    queue = _queue_for_target(target, base=base)
+    if queue and queue not in {"tmp", "state"}:
+        return write_queue_item(queue, target.name, data)
+
     tmp_dir = base / "tmp"
     tmp_dir.mkdir(parents=True, exist_ok=True)
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -83,8 +246,10 @@ def atomic_write_json(target: Path, data: Dict[str, Any], *, base: Optional[Path
     fd, tmp_name = tempfile.mkstemp(prefix=target.stem + "_", suffix=".tmp", dir=str(tmp_dir))
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
-            # 日本語はそのまま保存(spec §4 LLM 仕様)
-            json.dump(data, f, ensure_ascii=False, indent=2)
+            key = spool_crypto.load_key()
+            payload = spool_crypto.encrypt_json(data, key=key) if key else data
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+            f.write("\n")
             f.flush()
             os.fsync(f.fileno())
         os.rename(tmp_name, target)  # 同一 FS 上のアトミック rename
@@ -98,8 +263,10 @@ def atomic_write_json(target: Path, data: Dict[str, Any], *, base: Optional[Path
     return target
 
 
-def move_to(src: Path, subdir: str, *, base: Optional[Path] = None) -> Path:
+def move_to(src: Path | QueueItem, subdir: str, *, base: Optional[Path] = None) -> Path | QueueItem:
     """既存ファイルをスプール内の別サブディレクトリへアトミックに移す。"""
+    if isinstance(src, QueueItem):
+        return move_queue_item(src, subdir)
     base = Path(base) if base is not None else SPOOL_DIR
     src = Path(src)
     dest_dir = spool_path(subdir, base=base)
@@ -109,9 +276,17 @@ def move_to(src: Path, subdir: str, *, base: Optional[Path] = None) -> Path:
     return dest
 
 
-def read_json(path: Path) -> Dict[str, Any]:
+def read_json(path: Path | QueueItem) -> Dict[str, Any]:
+    if isinstance(path, QueueItem):
+        return read_queue_item(path)
     with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+        data = json.load(f)
+    if spool_crypto.is_encrypted_json(data):
+        key = spool_crypto.load_key()
+        if not key:
+            raise RuntimeError(f"{path} is encrypted but SUPPORT_AI_QUEUE_KEY is not configured")
+        return spool_crypto.decrypt_json(data, key=key)
+    return data
 
 
 def atomic_write_json_same_dir(target: Path, data: Dict[str, Any]) -> Path:
@@ -126,6 +301,7 @@ def atomic_write_json_same_dir(target: Path, data: Dict[str, Any]) -> Path:
             f.flush()
             os.fsync(f.fileno())
         os.rename(tmp_name, target)
+        os.chmod(target, 0o664)
     except Exception:
         try:
             os.unlink(tmp_name)
@@ -324,7 +500,7 @@ def load_agents_config(*, refresh: bool = False) -> Dict[str, Any]:
     try:
         if AGENTS_FILE.exists():
             loaded = read_json(AGENTS_FILE)
-            cfg["assignee_field_id"] = loaded.get("assignee_field_id")
+            cfg["assignee_field_id"] = ASSIGNEE_FIELD_ID_ENV or loaded.get("assignee_field_id")
             cfg["light_agents"] = loaded.get("light_agents") or []
             raw_map = loaded.get("escalation_map") or {}
             cfg["escalation_map_raw"] = raw_map
@@ -369,6 +545,8 @@ def sync_agents_config(*, dry_run: bool = False) -> Dict[str, Any]:
     if AGENTS_FILE.exists():
         loaded = read_json(AGENTS_FILE)
     loaded.setdefault("assignee_field_id", None)
+    if ASSIGNEE_FIELD_ID_ENV:
+        loaded["assignee_field_id"] = ASSIGNEE_FIELD_ID_ENV
     loaded.setdefault("escalation_map", {})
     loaded["light_agents"] = fetch_light_agents()
     resolved, errors = resolve_escalation_map(loaded.get("escalation_map") or {}, loaded["light_agents"])
@@ -445,13 +623,12 @@ def post_internal_note(ticket_id: int, body: str, tags: Optional[List[str]] = No
     spec §6: クローズ/アサイン/公開返信は行わない。
     """
     comment: Dict[str, Any] = {"body": body, "public": False}
+    ticket_update: Dict[str, Any] = {"comment": comment}
+    if tags:
+        current = fetch_ticket(ticket_id).get("tags") or []
+        ticket_update["tags"] = sorted(set(str(tag) for tag in current + list(tags) if tag))
     result = zd_request(
         "PUT", f"/api/v2/tickets/{ticket_id}.json",
-        json_body={"ticket": {"comment": comment}},
+        json_body={"ticket": ticket_update},
     )
-    if tags:
-        # Tags API への POST は既存タグを保持したままマージ追加する
-        # (ticket update の additional_tags はこのエンドポイントでは反映されない)
-        zd_request("POST", f"/api/v2/tickets/{ticket_id}/tags.json",
-                   json_body={"tags": list(tags)})
     return result

@@ -19,7 +19,7 @@ import llm_client
 import pii_mask
 
 
-TRIAGE_TAG = os.environ.get("TRIAGE_TAG", "ai_triaged")
+SUPPORT_AI_TRIAGE_TAG = os.environ.get("SUPPORT_AI_TRIAGE_TAG", "ai_triaged")
 
 
 def _extract_texts(ticket_id: int):
@@ -31,7 +31,7 @@ def _extract_texts(ticket_id: int):
     ticket = common.fetch_ticket(ticket_id)
     # Search インデックスの遅延で投稿済みチケットが再取得されることがある。
     # ライブのタグを確認し、二重投稿を防ぐ(spec §10 Search API の重複対策)。
-    if TRIAGE_TAG in (ticket.get("tags") or []):
+    if SUPPORT_AI_TRIAGE_TAG in (ticket.get("tags") or []):
         return None, None, True
     subject = ticket.get("subject") or ""
     comments = common.fetch_ticket_comments(ticket_id)
@@ -76,7 +76,7 @@ def process_one(path, verbose: bool = False) -> bool:
         if already:
             # 既に投稿済み。生成せず incoming から取り除く(LLM 呼び出しも省く)
             if verbose:
-                common.log(f"skip ticket_{ticket_id}: already tagged '{TRIAGE_TAG}'")
+                common.log(f"skip ticket_{ticket_id}: already tagged '{SUPPORT_AI_TRIAGE_TAG}'")
             path.unlink()
             return False
         # subject と 全 body を一貫マッピングでマスク
@@ -117,8 +117,7 @@ def process_one(path, verbose: bool = False) -> bool:
 
 def run_once(verbose: bool = False) -> int:
     common.ensure_spool_dirs()
-    incoming = common.spool_path("incoming")
-    files = sorted(incoming.glob("ticket_*.json"))
+    files = common.list_queue("incoming", "ticket_*.json")
     n = 0
     for f in files:
         if process_one(f, verbose=verbose):

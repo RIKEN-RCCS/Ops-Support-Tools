@@ -13,8 +13,8 @@ import time
 
 import common
 
-TRIAGE_TAG = os.environ.get("TRIAGE_TAG", "ai_triaged")
-SEARCH_QUERY = os.environ.get("TRIAGE_SEARCH_QUERY", f"type:ticket status:new -tags:{TRIAGE_TAG}")
+SUPPORT_AI_TRIAGE_TAG = os.environ.get("SUPPORT_AI_TRIAGE_TAG", "ai_triaged")
+SEARCH_QUERY = os.environ.get("SUPPORT_AI_TRIAGE_SEARCH_QUERY", f"type:ticket status:new -tags:{SUPPORT_AI_TRIAGE_TAG}")
 POLL_INTERVAL = 180  # 秒(spec §10 初期値)
 
 
@@ -32,8 +32,9 @@ def poll_once(verbose: bool = False) -> int:
         tid = t.get("id")
         if tid is None:
             continue
-        target = incoming / f"ticket_{tid}.json"
-        if target.exists():
+        name = f"ticket_{tid}.json"
+        target = incoming / name
+        if common.queue_exists("incoming", name):
             if verbose:
                 common.log(f"skip (already queued): ticket_{tid}")
             continue

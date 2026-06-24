@@ -1,33 +1,109 @@
+name: ops-support-tools
+
+x-support-secret-env: &support-secret-env
+  SUPPORT_AI_WEBHOOK_TOKEN_FILE: /run/secrets/support_ai_webhook_token
+  LLM_API_KEY_FILE: /run/secrets/llm_api_key
+  ZENDESK_KEY_FILE: /run/secrets/zendesk_key
+  SUPPORT_AI_QUEUE_KEY_FILE: /run/secrets/support_ai_queue_key
+
+x-support-secrets: &support-secrets
+  - llm_api_key
+  - zendesk_key
+  - support_ai_webhook_token
+  - support_ai_queue_key
+
 services:
   webhook:
-    build: ./apps/zendesk-triage-ai
+    build: ./apps/zendesk-support-ai
     command: ["python", "webhook.py", "--host", "0.0.0.0", "--port", "8080"]
-    env_file: .env
+    user: "10001:1000"
+    env_file:
+      - path: ./apps/zendesk-support-ai/.env
+        required: false
+    environment: *support-secret-env
+    secrets: *support-secrets
     ports:
-      - "8080:8080"
+      - "127.0.0.1:18080:8080"
     volumes:
-      - triage-spool:/data/spool
-      - triage-config:/config
+      - ./apps/zendesk-support-ai/data:/data/queue
+      - ./apps/zendesk-support-ai/config:/config
     restart: unless-stopped
 
   generator:
-    build: ./apps/zendesk-triage-ai
+    build: ./apps/zendesk-support-ai
     command: ["python", "generator.py", "-v", "--interval", "30"]
-    env_file: .env
+    user: "10001:1000"
+    env_file:
+      - path: ./apps/zendesk-support-ai/.env
+        required: false
+    environment: *support-secret-env
+    secrets: *support-secrets
     volumes:
-      - triage-spool:/data/spool
-      - triage-config:/config
+      - ./apps/zendesk-support-ai/data:/data/queue
+      - ./apps/zendesk-support-ai/config:/config
     restart: unless-stopped
 
   poster:
-    build: ./apps/zendesk-triage-ai
+    build: ./apps/zendesk-support-ai
     command: ["python", "poster.py", "-v", "--interval", "30"]
-    env_file: .env
+    user: "10001:1000"
+    env_file:
+      - path: ./apps/zendesk-support-ai/.env
+        required: false
+    environment: *support-secret-env
+    secrets: *support-secrets
     volumes:
-      - triage-spool:/data/spool
-      - triage-config:/config
+      - ./apps/zendesk-support-ai/data:/data/queue
+      - ./apps/zendesk-support-ai/config:/config
     restart: unless-stopped
 
-volumes:
-  triage-spool:
-  triage-config:
+  followup:
+    build: ./apps/zendesk-support-ai
+    command: ["python", "followup.py", "-v", "--interval", "30"]
+    user: "10001:1000"
+    env_file:
+      - path: ./apps/zendesk-support-ai/.env
+        required: false
+    environment: *support-secret-env
+    secrets: *support-secrets
+    volumes:
+      - ./apps/zendesk-support-ai/data:/data/queue
+      - ./apps/zendesk-support-ai/config:/config
+    restart: unless-stopped
+
+  followup-responder:
+    build: ./apps/zendesk-support-ai
+    command: ["python", "followup_responder.py", "-v", "--interval", "30"]
+    user: "10001:1000"
+    env_file:
+      - path: ./apps/zendesk-support-ai/.env
+        required: false
+    environment: *support-secret-env
+    secrets: *support-secrets
+    volumes:
+      - ./apps/zendesk-support-ai/data:/data/queue
+      - ./apps/zendesk-support-ai/config:/config
+    restart: unless-stopped
+
+  knowledge-api:
+    build: ./apps/knowledge-api
+    user: "10002:1000"
+    secrets:
+      - knowledge_field_key
+    ports:
+      - "127.0.0.1:18180:8080"
+    volumes:
+      - ./apps/knowledge-api/data:/data
+    restart: unless-stopped
+
+secrets:
+  llm_api_key:
+    file: ./apps/zendesk-support-ai/secrets/llm_api_key
+  zendesk_key:
+    file: ./apps/zendesk-support-ai/secrets/zendesk_key
+  support_ai_webhook_token:
+    file: ./apps/zendesk-support-ai/secrets/support_ai_webhook_token
+  support_ai_queue_key:
+    file: ./apps/zendesk-support-ai/secrets/support_ai_queue_key
+  knowledge_field_key:
+    file: ./apps/knowledge-api/secrets/knowledge_field_key

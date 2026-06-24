@@ -24,8 +24,8 @@ import common
 import llm_client
 import pii_mask
 
-TRIAGE_TAG = os.environ.get("TRIAGE_TAG", "ai_triaged")
-SYNC_AGENTS_ON_POST = os.environ.get("TRIAGE_SYNC_AGENTS_ON_POST", "1").lower() in ("1", "true", "yes")
+SUPPORT_AI_TRIAGE_TAG = os.environ.get("SUPPORT_AI_TRIAGE_TAG", "ai_triaged")
+SYNC_AGENTS_ON_POST = os.environ.get("SUPPORT_AI_SYNC_AGENTS_ON_POST", "1").lower() in ("1", "true", "yes")
 MAX_NOTE_LEN = 30000  # 社内メモ本文長の上限(安全側)
 MIN_NOTE_LEN = 20
 
@@ -145,7 +145,7 @@ def process_one(path, *, dry_run: bool, verbose: bool = False) -> bool:
     if can_assign:
         final_body = final_body.rstrip() + f"\n\n■ システム割り当て: {assignee_name}({via})"
     # a,b: 内部メモ + タグ
-    common.post_internal_note(int(ticket_id), final_body, tags=[TRIAGE_TAG])
+    common.post_internal_note(int(ticket_id), final_body, tags=[SUPPORT_AI_TRIAGE_TAG])
     # c: カスタムフィールド「担当者」セット(可能な場合のみ)
     if can_assign:
         common.set_assignee_field(int(ticket_id), agent_id)
@@ -156,14 +156,13 @@ def process_one(path, *, dry_run: bool, verbose: bool = False) -> bool:
     common.move_to(path, "done")
     if verbose:
         a = f", assigned {assignee_name} via {via}" if can_assign else " (担当未設定)"
-        common.log(f"posted note + tag '{TRIAGE_TAG}' to ticket_{ticket_id}{a} -> done/")
+        common.log(f"posted note + tag '{SUPPORT_AI_TRIAGE_TAG}' to ticket_{ticket_id}{a} -> done/")
     return True
 
 
 def run_once(*, dry_run: bool, verbose: bool = False) -> int:
     common.ensure_spool_dirs()
-    pending = common.spool_path("pending")
-    files = sorted(pending.glob("ticket_*.json"))
+    files = common.list_queue("pending", "ticket_*.json")
     if files and SYNC_AGENTS_ON_POST:
         try:
             cfg = common.sync_agents_config()
@@ -179,7 +178,7 @@ def run_once(*, dry_run: bool, verbose: bool = False) -> int:
             if process_one(f, dry_run=dry_run, verbose=verbose):
                 n += 1
         except Exception as e:
-            common.log(f"post error ticket (file {f.name}): {e}")
+            common.log(f"post error ticket (item {f.name}): {e}")
             # 投稿失敗はファイルを pending に残す(リトライ容易性 — spec §2)
     if verbose:
         common.log(f"poster done: {len(files)} pending, {n} {'validated' if dry_run else 'posted'}")

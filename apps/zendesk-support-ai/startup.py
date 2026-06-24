@@ -32,12 +32,12 @@ def _retry(label: str, fn: Callable[[], object], *, retries: int, delay: float) 
 
 
 def preflight() -> None:
-    if not _enabled("TRIAGE_STARTUP_CHECKS", "1"):
+    if not _enabled("SUPPORT_AI_STARTUP_CHECKS", "1"):
         common.log("startup checks disabled")
         return
 
-    retries = int(os.environ.get("TRIAGE_STARTUP_RETRIES", "3"))
-    delay = float(os.environ.get("TRIAGE_STARTUP_RETRY_DELAY", "5"))
+    retries = int(os.environ.get("SUPPORT_AI_STARTUP_RETRIES", "3"))
+    delay = float(os.environ.get("SUPPORT_AI_STARTUP_RETRY_DELAY", "5"))
 
     common.ensure_spool_dirs()
     common.log(f"startup ok: spool ready at {common.SPOOL_DIR}")
@@ -51,7 +51,7 @@ def preflight() -> None:
 
     _retry("llm", llm_client.healthcheck, retries=retries, delay=delay)
 
-    if _enabled("TRIAGE_SYNC_AGENTS_ON_STARTUP", "1"):
+    if _enabled("SUPPORT_AI_SYNC_AGENTS_ON_STARTUP", "1"):
         cfg = _retry("agents sync", common.sync_agents_config, retries=retries, delay=delay)
         if isinstance(cfg, dict):
             common.log(f"startup agents synced: {len(cfg.get('light_agents', []))} light agents")
