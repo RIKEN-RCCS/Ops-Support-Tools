@@ -5,6 +5,13 @@ __pycache__/
 .env
 .env.*
 !.env.example
+secrets/
+apps/*/.env
+apps/*/.env.*
+!apps/*/.env.example
+apps/*/secrets/
+apps/*/config/
+apps/*/data/
 
 apps/*/agents.json
 apps/*/spool/

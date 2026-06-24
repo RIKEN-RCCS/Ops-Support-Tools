@@ -10,7 +10,7 @@ import common
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Sync Zendesk light agents into TRIAGE_AGENTS_FILE")
+    ap = argparse.ArgumentParser(description="Sync Zendesk light agents into SUPPORT_AI_AGENTS_FILE")
     ap.add_argument("--dry-run", action="store_true", help="fetch and validate without writing agents.json")
     args = ap.parse_args()
 
