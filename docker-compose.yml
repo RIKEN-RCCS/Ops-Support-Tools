@@ -5,6 +5,8 @@ x-support-secret-env: &support-secret-env
   LLM_API_KEY_FILE: /run/secrets/llm_api_key
   ZENDESK_KEY_FILE: /run/secrets/zendesk_key
   SUPPORT_AI_QUEUE_KEY_FILE: /run/secrets/support_ai_queue_key
+  SUPPORT_AI_KNOWLEDGE_API_URL: http://knowledge-api:8080
+  SUPPORT_AI_CREATE_KNOWLEDGE_RUNS: "1"
 
 x-support-secrets: &support-secrets
   - llm_api_key
@@ -28,6 +30,8 @@ services:
       - ./apps/zendesk-support-ai/data:/data/queue
       - ./apps/zendesk-support-ai/config:/config
     restart: unless-stopped
+    depends_on:
+      - knowledge-api
 
   generator:
     build: ./apps/zendesk-support-ai
@@ -42,6 +46,8 @@ services:
       - ./apps/zendesk-support-ai/data:/data/queue
       - ./apps/zendesk-support-ai/config:/config
     restart: unless-stopped
+    depends_on:
+      - knowledge-api
 
   poster:
     build: ./apps/zendesk-support-ai

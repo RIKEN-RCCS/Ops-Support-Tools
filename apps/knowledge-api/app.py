@@ -59,7 +59,7 @@ LAYOUT = """
 
 
 def _render(title: str, body: str, **context: Any) -> str:
-    inner = render_template_string(body, **context)
+    inner = render_template_string(body, link=_web_url, **context)
     return render_template_string(LAYOUT, title=title, css=BASE_CSS, body=inner, link=_web_url)
 
 

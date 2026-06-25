@@ -70,8 +70,12 @@ def test_empty_roster_returns_none():
 
 
 def test_validate_rejects_bad_difficulty():
-    base = {"ticket_id": 1, "severity": "low", "category": "other",
-            "difficulty": "URGENT", "note_body": "x" * 50, "mask_mapping": {}}
+    base = {"ticket_id": 1, "severity": "not_assessed", "category": "other",
+            "difficulty": "URGENT", "answer_confidence": "low",
+            "requires_environment_knowledge": False, "requires_runbook": False,
+            "requires_operator_check": True, "safe_to_reply_to_user": False,
+            "suggested_next_action": "review before replying",
+            "note_body": "x" * 50, "mask_mapping": {}}
     try:
         poster.validate(base)
         assert False, "should have raised"

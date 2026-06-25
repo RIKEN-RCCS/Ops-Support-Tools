@@ -34,6 +34,22 @@ class ValidationError(Exception):
     pass
 
 
+def normalize_record(record: dict) -> dict:
+    """旧pendingレコードを新しいtriage gateスキーマへ寄せる。
+
+    デプロイ前に生成済みのpendingをfailedへ落とさないための互換処理。
+    新規生成分はgenerator側で明示的に値を持つ。
+    """
+    record.setdefault("answer_confidence", "medium")
+    record.setdefault("severity", "not_assessed")
+    record.setdefault("requires_environment_knowledge", False)
+    record.setdefault("requires_runbook", False)
+    record.setdefault("requires_operator_check", True)
+    record.setdefault("safe_to_reply_to_user", False)
+    record.setdefault("suggested_next_action", "Review the AI triage note before replying to the user.")
+    return record
+
+
 def resolve_assignee(
     difficulty: str, category: str, *, cursor: int, light_agents: list,
     escalation_map: dict, seed: int = 0,
@@ -84,6 +100,20 @@ def validate(record: dict) -> None:
     diff = record.get("difficulty")
     if diff not in llm_client.DIFFICULTIES:
         raise ValidationError(f"不正な difficulty: {diff!r}")
+    confidence = record.get("answer_confidence")
+    if confidence not in llm_client.ANSWER_CONFIDENCES:
+        raise ValidationError(f"不正な answer_confidence: {confidence!r}")
+    for key in (
+        "requires_environment_knowledge",
+        "requires_runbook",
+        "requires_operator_check",
+        "safe_to_reply_to_user",
+    ):
+        if not isinstance(record.get(key), bool):
+            raise ValidationError(f"{key} が bool でない")
+    action = record.get("suggested_next_action")
+    if not isinstance(action, str):
+        raise ValidationError("suggested_next_action が str でない")
     body = record.get("note_body")
     if not isinstance(body, str) or not (MIN_NOTE_LEN <= len(body) <= MAX_NOTE_LEN):
         raise ValidationError(f"note_body の長さが不正: {len(body) if isinstance(body, str) else 'N/A'}")
@@ -96,7 +126,7 @@ def validate(record: dict) -> None:
 
 
 def process_one(path, *, dry_run: bool, verbose: bool = False) -> bool:
-    record = common.read_json(path)
+    record = normalize_record(common.read_json(path))
     ticket_id = record.get("ticket_id")
     try:
         validate(record)
@@ -136,7 +166,7 @@ def process_one(path, *, dry_run: bool, verbose: bool = False) -> bool:
             who = f"{assignee_name} via {via}" if agent_id is not None else "(担当者なし: 名簿未設定)"
             note = "" if can_assign else " [フィールド書込はスキップ: assignee_field_id 未設定 or 担当者なし]"
             common.log(f"[dry-run] would post note to ticket_{ticket_id} "
-                       f"({record['severity']}/{record['category']}/{record['difficulty']}); "
+                       f"(urgency:not_assessed/{record['category']}/{record['difficulty']}); "
                        f"would assign {who}{note}; cursor は進めない")
         return True
 
