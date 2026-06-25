@@ -91,6 +91,38 @@ services:
       - ./apps/zendesk-support-ai/config:/config
     restart: unless-stopped
 
+  runbook-worker:
+    build: ./apps/zendesk-support-ai
+    command: ["python", "runbook_worker.py", "-v", "--interval", "60"]
+    user: "10001:1000"
+    env_file:
+      - path: ./apps/zendesk-support-ai/.env
+        required: false
+    environment: *support-secret-env
+    secrets: *support-secrets
+    volumes:
+      - ./apps/zendesk-support-ai/data:/data/queue
+      - ./apps/zendesk-support-ai/config:/config
+    restart: unless-stopped
+    depends_on:
+      - knowledge-api
+
+  runbook-review-worker:
+    build: ./apps/zendesk-support-ai
+    command: ["python", "runbook_review_worker.py", "-v", "--interval", "60"]
+    user: "10001:1000"
+    env_file:
+      - path: ./apps/zendesk-support-ai/.env
+        required: false
+    environment: *support-secret-env
+    secrets: *support-secrets
+    volumes:
+      - ./apps/zendesk-support-ai/data:/data/queue
+      - ./apps/zendesk-support-ai/config:/config
+    restart: unless-stopped
+    depends_on:
+      - knowledge-api
+
   knowledge-api:
     build: ./apps/knowledge-api
     user: "10002:1000"

@@ -21,6 +21,7 @@ from typing import Any, Dict, Optional
 import requests
 
 from secret_config import env_secret
+import target_normalizer
 
 LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "https://api.example.com/v1").rstrip("/")
 DEFAULT_MODEL = os.environ.get("SUPPORT_AI_MODEL", "")
@@ -61,6 +62,11 @@ INVESTIGATION_DECISIONS = [
     "operator_review",
 ]
 RUNBOOK_CHANGES = ["none", "append_context", "deepen", "broaden", "replace", "initial"]
+ENVIRONMENT_CANDIDATES = target_normalizer.environment_candidates()
+MACHINE_CANDIDATES = target_normalizer.machine_candidates()
+MACHINE_ALIAS_GUIDE = target_normalizer.machine_alias_guide()
+TARGET_CONFIDENCES = ["none", "low", "medium", "high"]
+TARGET_RESOLUTIONS = ["identified_from_text", "ask_user", "operator_select", "runbook_identify", "unknown_stop"]
 
 # トリアージ出力スキーマ。政治的・運用的優先度はAI判断から外すため severity は出させない。
 SUPPORT_AI_TRIAGE_SCHEMA: Dict[str, Any] = {
@@ -104,12 +110,33 @@ SUPPORT_AI_TRIAGE_SCHEMA: Dict[str, Any] = {
             "type": "string",
             "description": "担当者向けの次アクション。環境確認や runbook 実行が必要なら具体的に書く",
         },
+        "environment": {
+            "type": "string",
+            "description": "本文から候補内の環境を高確信で特定できる場合のみ値を入れる。不明なら空文字",
+        },
+        "machine": {
+            "type": "string",
+            "description": "本文から候補内のmachineを高確信で特定できる場合のみcanonical machine名を入れる。不明なら空文字",
+        },
+        "environment_confidence": {"type": "string", "enum": TARGET_CONFIDENCES},
+        "machine_confidence": {"type": "string", "enum": TARGET_CONFIDENCES},
+        "target_resolution": {
+            "type": "string",
+            "enum": TARGET_RESOLUTIONS,
+            "description": "対象environment/machineの決め方。本文で高確信なら identified_from_text、不明なら次の処理方針を選ぶ",
+        },
+        "target_resolution_reason": {
+            "type": "string",
+            "description": "target_resolutionを選んだ理由。候補、根拠、迷いどころを短く書く",
+        },
     },
     "required": [
         "summary", "probable_cause", "category", "difficulty",
         "clarifying_questions", "draft_reply",
         "requires_environment_knowledge", "requires_runbook", "requires_operator_check",
         "safe_to_reply_to_user", "answer_confidence", "suggested_next_action",
+        "environment", "machine", "environment_confidence", "machine_confidence",
+        "target_resolution", "target_resolution_reason",
     ],
     "additionalProperties": False,
 }
@@ -185,6 +212,140 @@ RUNBOOK_DECISION_SCHEMA: Dict[str, Any] = {
         "reason",
         "runbook_delta",
         "answer_draft_policy",
+    ],
+    "additionalProperties": False,
+}
+
+RUNBOOK_PLAN_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "title": {"type": "string"},
+        "problem_summary": {"type": "string"},
+        "environment_scope": {"type": "string"},
+        "knowledge_queries": {"type": "array", "items": {"type": "string"}},
+        "read_only_checks": {"type": "array", "items": {"type": "string"}},
+        "risk_review": {"type": "array", "items": {"type": "string"}},
+        "requires_human_approval": {"type": "boolean"},
+        "approval_reasons": {"type": "array", "items": {"type": "string"}},
+        "stop_conditions": {"type": "array", "items": {"type": "string"}},
+        "execution_steps": {"type": "array", "items": {"type": "string"}},
+        "findings_template": {"type": "string"},
+        "issue_on_run_template": {"type": "string"},
+        "summary_template": {"type": "string"},
+        "answer_draft_policy": {"type": "string", "enum": ["hold", "draft_after_findings", "no_reply"]},
+        "answer_draft_skeleton": {"type": "string"},
+        "operator_notes": {"type": "string"},
+    },
+    "required": [
+        "title",
+        "problem_summary",
+        "environment_scope",
+        "knowledge_queries",
+        "read_only_checks",
+        "risk_review",
+        "requires_human_approval",
+        "approval_reasons",
+        "stop_conditions",
+        "execution_steps",
+        "findings_template",
+        "issue_on_run_template",
+        "summary_template",
+        "answer_draft_policy",
+        "answer_draft_skeleton",
+        "operator_notes",
+    ],
+    "additionalProperties": False,
+}
+
+RUNBOOK_RISK_REVIEW_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "verdict": {"type": "string", "enum": ["pass", "revise", "block"]},
+        "risk_level": {"type": "string", "enum": ["low", "medium", "high", "blocked"]},
+        "summary": {"type": "string"},
+        "requires_human_approval": {"type": "boolean"},
+        "unsafe_operations": {"type": "array", "items": {"type": "string"}},
+        "missing_approvals": {"type": "array", "items": {"type": "string"}},
+        "missing_risk_controls": {"type": "array", "items": {"type": "string"}},
+        "revise_requests": {"type": "array", "items": {"type": "string"}},
+        "stop_conditions": {"type": "array", "items": {"type": "string"}},
+        "operator_notes": {"type": "string"},
+    },
+    "required": [
+        "verdict",
+        "risk_level",
+        "summary",
+        "requires_human_approval",
+        "unsafe_operations",
+        "missing_approvals",
+        "missing_risk_controls",
+        "revise_requests",
+        "stop_conditions",
+        "operator_notes",
+    ],
+    "additionalProperties": False,
+}
+
+RUNBOOK_TECHNICAL_REVIEW_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "verdict": {"type": "string", "enum": ["pass", "revise", "block"]},
+        "confidence": {"type": "string", "enum": ["low", "medium", "high"]},
+        "summary": {"type": "string"},
+        "missing_knowledge_queries": {"type": "array", "items": {"type": "string"}},
+        "known_issue_checks": {"type": "array", "items": {"type": "string"}},
+        "unsupported_assumptions": {"type": "array", "items": {"type": "string"}},
+        "revise_requests": {"type": "array", "items": {"type": "string"}},
+        "answer_readiness": {"type": "string", "enum": ["not_ready", "ready_after_findings", "ready"]},
+        "operator_notes": {"type": "string"},
+    },
+    "required": [
+        "verdict",
+        "confidence",
+        "summary",
+        "missing_knowledge_queries",
+        "known_issue_checks",
+        "unsupported_assumptions",
+        "revise_requests",
+        "answer_readiness",
+        "operator_notes",
+    ],
+    "additionalProperties": False,
+}
+
+RUNBOOK_CHIEF_REVIEW_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "verdict": {"type": "string", "enum": ["pass", "revise", "block"]},
+        "summary": {"type": "string"},
+        "risk_verdict": {"type": "string", "enum": ["pass", "revise", "block"]},
+        "technical_verdict": {"type": "string", "enum": ["pass", "revise", "block"]},
+        "risk_points": {"type": "array", "items": {"type": "string"}},
+        "technical_points": {"type": "array", "items": {"type": "string"}},
+        "reviewer_conflicts": {"type": "array", "items": {"type": "string"}},
+        "missing_coverage": {"type": "array", "items": {"type": "string"}},
+        "final_revise_requests": {"type": "array", "items": {"type": "string"}},
+        "planner_patch_instructions": {"type": "array", "items": {"type": "string"}},
+        "evidence_to_collect": {"type": "array", "items": {"type": "string"}},
+        "pass_conditions": {"type": "array", "items": {"type": "string"}},
+        "human_decision_needed": {"type": "array", "items": {"type": "string"}},
+        "operator_notes": {"type": "string"},
+    },
+    "required": [
+        "verdict",
+        "summary",
+        "risk_verdict",
+        "technical_verdict",
+        "risk_points",
+        "technical_points",
+        "reviewer_conflicts",
+        "missing_coverage",
+        "final_revise_requests",
+        "planner_patch_instructions",
+        "evidence_to_collect",
+        "pass_conditions",
+        "human_decision_needed",
+        "operator_notes",
     ],
     "additionalProperties": False,
 }
@@ -421,6 +582,21 @@ def triage(masked_subject: str, masked_body: str, *, model: Optional[str] = None
         "『こちらで環境/提供状況を確認する』趣旨の保守的な文案にしてください。"
         "特にユーザーに初歩的な情報を過剰に要求する前に、サポート側で確認すべき環境情報がないか判定してください。"
         "担当者の人選はしないでください(それはシステム側が決めます)。"
+        f"environment候補: {', '.join(ENVIRONMENT_CANDIDATES) if ENVIRONMENT_CANDIDATES else '(未設定)'}。"
+        f"machine候補: {', '.join(MACHINE_CANDIDATES) if MACHINE_CANDIDATES else '(未設定)'}。"
+        f"machine alias map: {MACHINE_ALIAS_GUIDE}。"
+        "本文から候補内のenvironment/machineを高確信で特定できる場合だけ environment/machine に値を入れてください。"
+        "machineは必ずcanonical machine名を出してください。alias表記はcanonicalへ正規化してください。"
+        "候補が未設定、複数候補があり迷う、または本文根拠が弱い場合は空文字にし、confidenceはlowまたはnoneにしてください。"
+        "GH200/GB200のような機種名・GPU名・構成名だけではmachineを特定しないでください。"
+        "それらが複数の別システムにあり得る場合は空文字にしてください。"
+        "対象environment/machineが回答に必要なのに特定できない場合は、clarifying_questionsに対象環境を尋ねる質問を入れてください。"
+        "target_resolutionは次から選んでください。"
+        "identified_from_text=本文だけで候補内の対象を高確信に特定できる、"
+        "ask_user=ユーザーに対象環境を聞くのが最短で安全、"
+        "operator_select=担当者がZendeskフォーム/タグ/運用文脈から選ぶべき、"
+        "runbook_identify=Knowledgeや既存チケット、実機に触れない範囲の調査で特定できそう、"
+        "unknown_stop=対象不明のまま自動処理を止めるべき。"
     )
     user = (
         f"# チケット件名\n{masked_subject}\n\n"
@@ -593,6 +769,294 @@ def normalize_runbook_decision(decision: Dict[str, Any]) -> Dict[str, Any]:
     normalized.setdefault("runbook_delta", "none")
     normalized.setdefault("answer_draft_policy", "hold")
     return normalized
+
+
+def generate_runbook_plan(run: Dict[str, Any], *, model: Optional[str] = None) -> Dict[str, Any]:
+    """Knowledge run から、実行前レビュー用の詳細 runbook plan を生成する。"""
+    system = (
+        SUPPORT_CONTEXT
+        + " "
+        "あなたはHPC/研究計算サポートのrunbook計画エージェントです。"
+        "渡されるのはKnowledge APIに登録された未実行runです。"
+        "目的は、公開返信前に必要な環境固有情報、既存知見、実機状態を確認するための"
+        "安全なrunbook plan、risk review、実行結果テンプレートを作ることです。"
+        "実機操作は読み取り系コマンドと確認作業を優先してください。"
+        "module load、ビルド、インストール、設定変更、ジョブ投入、ユーザーデータ参照は"
+        "読み取り専用として扱わず、人間承認が必要な候補として扱ってください。"
+        "破壊的操作、権限変更、ユーザーデータ変更、サービス影響がある操作は"
+        "execution_stepsに実行手順として入れず、risk_review、approval_reasons、stop_conditionsへ回してください。"
+        "環境固有情報が必要な場合は、一般論で断定せずKnowledge/実機確認を要求してください。"
+        "存在未確認のツール名、module名、パス、運用方針を断定しないでください。"
+        "対象environmentまたはmachineが未特定の場合、requires_human_approvalはtrue、"
+        "answer_draft_policyはholdにしてください。"
+        "review_contextにhuman-revision-requestがある場合は、Must Fixを一回の改訂planでまとめて反映してください。"
+        "review_contextにrunbook-chief-reviewまたはrunbook-revision-requestがある場合は、"
+        "Planner Patch Instructions、Evidence To Collect、Pass Conditionsを最優先で反映してください。"
+        "抽象的なFinal Revise Requestsをそのまま繰り返すのではなく、runbookの具体的なKnowledge Queries、"
+        "Read-only Checks、Execution Steps、Findings Template、Summary Template、Answer Draft Skeletonへ展開してください。"
+        "査読指摘をすべて満たすと調査範囲が大きくなりすぎる場合は、今回のrunbookのスコープを縮小してください。"
+        "縮小した範囲で確実に確認できること、未確認として後続調査へ送ること、ユーザー回答で断定しないことを明示すればよいです。"
+        "一回のrunbookで完全解決を目指しすぎず、今回のfindings/summary/answer_draftで安全に言える範囲を定義してください。"
+        "Human Decision Neededがnoneまたは空の場合、人間に改訂内容を考えさせる前提にしないでください。"
+        "Nice To Fixは可能なら反映し、反映しない場合はoperator_notesに理由を書いてください。"
+        "Pass If Fixedは後続reviewが確認する条件なので、plan側では満たすための具体的な変更を入れてください。"
+        "answer_draft_skeletonには、確認済みでないmodule load、MPI実装名、configure/build option、"
+        "管理者作業依頼、自前ビルド推奨を含めないでください。"
+        "ユーザー向け回答案は、findings登録後に埋めるプレースホルダー形式に留めてください。"
+        "緊急度・優先度・重要度は判断しないでください。"
+        "必ず指定JSONスキーマだけを返してください。"
+    )
+    compact_run = {
+        "id": run.get("id"),
+        "ticket_id": run.get("ticket_id"),
+        "environment": run.get("environment"),
+        "machine": run.get("machine"),
+        "status": run.get("status"),
+        "summary": run.get("summary"),
+        "runbook": run.get("runbook"),
+        "issue_on_run": run.get("issue_on_run"),
+        "document_count": run.get("document_count"),
+        "review_context": run.get("review_context"),
+    }
+    user = (
+        "# Knowledge run\n"
+        f"{json.dumps(compact_run, ensure_ascii=False, indent=2)}\n\n"
+        "このrunに対して、後続AIまたは人間が安全にレビュー・実行できるrunbook planを作成してください。"
+    )
+    candidates = runbook_model_candidates(model)
+    last_err: Optional[Exception] = None
+    for m in candidates:
+        try:
+            result = chat_json(
+                system,
+                user,
+                RUNBOOK_PLAN_SCHEMA,
+                model=m,
+                schema_name="runbook_plan",
+                temperature=0.0,
+                max_tokens=4096,
+            )
+            result["_model"] = m
+            return result
+        except Exception as e:  # noqa: BLE001
+            last_err = e
+            continue
+    raise RuntimeError(f"全runbookモデルで失敗しました: {last_err}")
+
+
+def _compact_run_documents(documents: list[Dict[str, Any]]) -> list[Dict[str, Any]]:
+    compact = []
+    for doc in documents[-12:]:
+        body = str(doc.get("body_md") or "")
+        compact.append({
+            "id": doc.get("id"),
+            "role": doc.get("role"),
+            "kind": doc.get("kind"),
+            "title": doc.get("title"),
+            "summary": doc.get("summary"),
+            "tags": doc.get("tags"),
+            "body_md": body[:12000],
+        })
+    return compact
+
+
+def generate_runbook_risk_review(
+    run: Dict[str, Any],
+    documents: list[Dict[str, Any]],
+    *,
+    model: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Runbook plan の実機操作リスクを評価する。"""
+    system = (
+        SUPPORT_CONTEXT
+        + " "
+        "あなたはHPC/研究計算サポートのrunbook risk評価AIです。"
+        "別にtechnical評価AIが調査設計・既知問題・回答根拠を査読し、最後にchief review AIが両者の重複・矛盾・抜け漏れを統合します。"
+        "あなたはchiefに渡すrisk専門査読だけを作成してください。"
+        "目的は、runbook planを実行前に読み、実機操作・権限・ユーザーデータ・サービス影響・"
+        "ロールバック・人間承認の観点で安全性を評価することです。"
+        "技術的に正しいか、調査が効率的か、既知問題を十分調べているかは評価対象外です。"
+        "実行してよいか、エージェントが範囲外操作をする余地がないか、権限境界が明確か、どこで止めるべきかだけを判断してください。"
+        "CUDA/GCC/MPI/HPC-Xの互換性、ABI、module選択、Knowledge検索不足、回答根拠の薄さはrisk評価の対象外です。"
+        "それらを見つけてもrevise理由にせず、unsafe_operations/missing_risk_controls/revise_requestsへ入れないでください。"
+        "module load、ビルド、インストール、設定変更、ジョブ投入、ユーザーデータ参照は"
+        "明示承認なしに安全とはみなしません。"
+        "ただし、module loadや確認コマンドが技術的に必要かどうかは判断しないでください。"
+        "判断するのは、その操作が実行前承認・対象環境・影響範囲・停止条件で安全に囲われているかだけです。"
+        "environment/machineが未特定であること自体をtechnical不足として扱わないでください。"
+        "ただし未特定のまま実機操作へ進む余地がplan内にある場合はriskとして指摘してください。"
+        "Attached documentsにhuman-revision-requestがありreview_mode=check_human_fixes_firstの場合、"
+        "まずMust Fixのうち実機操作安全に関係する部分だけを確認してください。"
+        "Must Fixが技術内容(module選択、互換性調査、回答根拠など)ならrisk側では成否判定しないでください。"
+        "Must Fixが満たされ、新しい範囲外操作・権限逸脱・ユーザーデータ参照・サービス影響が増えていなければ、"
+        "同じ指摘を繰り返してreviseしないでください。"
+        "危険な手順を直接実行するコマンド列として補完しないでください。"
+        "修正が必要な場合は、revise_requestsに具体的な差し戻し事項を書いてください。"
+        "必ず指定JSONスキーマだけを返してください。"
+    )
+    user = (
+        "# Knowledge run\n"
+        f"{json.dumps(run, ensure_ascii=False, indent=2)}\n\n"
+        "# Attached documents\n"
+        f"{json.dumps(_compact_run_documents(documents), ensure_ascii=False, indent=2)}\n\n"
+        "runbook planをrisk観点で評価してください。"
+    )
+    candidates = runbook_model_candidates(model)
+    last_err: Optional[Exception] = None
+    for m in candidates:
+        try:
+            result = chat_json(
+                system,
+                user,
+                RUNBOOK_RISK_REVIEW_SCHEMA,
+                model=m,
+                schema_name="runbook_risk_review",
+                temperature=0.0,
+                max_tokens=4096,
+            )
+            result["_model"] = m
+            return result
+        except Exception as e:  # noqa: BLE001
+            last_err = e
+            continue
+    raise RuntimeError(f"全runbook risk評価モデルで失敗しました: {last_err}")
+
+
+def generate_runbook_technical_review(
+    run: Dict[str, Any],
+    documents: list[Dict[str, Any]],
+    *,
+    model: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Runbook plan の技術評価と既知問題の踏み直し防止観点を評価する。"""
+    system = (
+        SUPPORT_CONTEXT
+        + " "
+        "あなたはHPC/研究計算サポートのrunbook technical評価AIです。"
+        "別にrisk評価AIが実機操作安全・権限・承認・停止条件を査読し、最後にchief review AIが両者の重複・矛盾・抜け漏れを統合します。"
+        "あなたはchiefに渡すtechnical専門査読だけを作成してください。"
+        "目的は、runbook planが調査コスト、効率、具体性、再利用性、過去知見・既知問題の活用の面で良い計画かを評価し、"
+        "同じ落とし穴を再度踏まず、少ない手戻りで回答根拠を作れるように差し戻すことです。"
+        "未確認のmodule名、MPI実装、CUDA/GCC/HPC-X互換性、運用方針、サポート範囲を断定していないか確認してください。"
+        "不足するKnowledge検索、既知問題確認、環境確認、回答前に必要な根拠を具体的に挙げてください。"
+        "risk評価とは別に、実行権限、破壊的操作、ユーザーデータ参照、サービス影響、承認要否は評価しないでください。"
+        "それらを見つけてもtechnicalのrevise理由にせず、調査設計の不足だけを扱ってください。"
+        "module load、ビルド、ジョブ投入、ユーザーデータ参照が安全に許可されているかはtechnical評価の対象外です。"
+        "ただし、それらのコマンドを調査手段として使う場合に、何を確認するための手段か、代替のKnowledge確認があるか、"
+        "結果をどうfindings/summary/answer_draftへ反映するかが曖昧ならtechnical不足として指摘してください。"
+        "Attached documentsにhuman-revision-requestがありreview_mode=check_human_fixes_firstの場合、"
+        "まずMust Fixのうち調査設計・具体性・既知問題確認に関係する部分だけを確認してください。"
+        "Must Fixが実機操作安全、権限、承認、停止条件だけならtechnical側では成否判定しないでください。"
+        "Must Fixが満たされ、Pass If Fixed条件にも反していなければ、同じ指摘を繰り返してreviseしないでください。"
+        "Nice To Fixの未対応だけで自動差し戻ししないでください。"
+        "修正が必要な場合は、revise_requestsに具体的な差し戻し事項を書いてください。"
+        "必ず指定JSONスキーマだけを返してください。"
+    )
+    user = (
+        "# Knowledge run\n"
+        f"{json.dumps(run, ensure_ascii=False, indent=2)}\n\n"
+        "# Attached documents\n"
+        f"{json.dumps(_compact_run_documents(documents), ensure_ascii=False, indent=2)}\n\n"
+        "runbook planをtechnical/known-issues観点で評価してください。"
+    )
+    candidates = runbook_model_candidates(model)
+    last_err: Optional[Exception] = None
+    for m in candidates:
+        try:
+            result = chat_json(
+                system,
+                user,
+                RUNBOOK_TECHNICAL_REVIEW_SCHEMA,
+                model=m,
+                schema_name="runbook_technical_review",
+                temperature=0.0,
+                max_tokens=4096,
+            )
+            result["_model"] = m
+            return result
+        except Exception as e:  # noqa: BLE001
+            last_err = e
+            continue
+    raise RuntimeError(f"全runbook technical評価モデルで失敗しました: {last_err}")
+
+
+def generate_runbook_chief_review(
+    run: Dict[str, Any],
+    documents: list[Dict[str, Any]],
+    risk: Dict[str, Any],
+    technical: Dict[str, Any],
+    *,
+    model: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Risk/technical reviews を統合し、人間とplanner向けの最終査読を作る。"""
+    system = (
+        SUPPORT_CONTEXT
+        + " "
+        "あなたはHPC/研究計算サポートのrunbook chief review AIです。"
+        "risk評価AIとtechnical評価AIの査読結果、および最新runbook planを読み、"
+        "人間とrunbook生成エージェントが使う最終レビューを一本化してください。"
+        "あなたの責務は、査読者間の重複、矛盾、抜け漏れ、観点混在を整理し、"
+        "risk項目とtechnical項目を明確に分離したうえで、最小限のfinal_revise_requestsを作ることです。"
+        "人間に改訂内容を考えさせてはいけません。"
+        "final_revise_requestsだけで終わらせず、planner_patch_instructionsに、runbook生成エージェントが"
+        "そのまま次のrunbookへ反映できる具体的な追加・置換指示を書いてください。"
+        "『Knowledge検索が不足』『ABI互換性を確認』のような抽象表現だけは禁止です。"
+        "どのsectionに何を追加するか、どの確認をどの目的で行うか、結果をfindings/summary/answer_draftへどう渡すかまで書いてください。"
+        "evidence_to_collectには、実機エージェントまたは後続AIが集めるべき根拠を、確認対象と期待する出力形式が分かる粒度で書いてください。"
+        "human_decision_neededには、人間の運用判断が本当に必要なものだけを書いてください。AI/実機確認で進められるものを人間判断に回さないでください。"
+        "pass_conditionsには、次回レビューでpassしてよい客観条件を書いてください。"
+        "査読指摘を完全に満たすために調査範囲が膨らみすぎる場合は、reviseを出す前にスコープ縮小で通せるか検討してください。"
+        "スコープ縮小で通せる場合は、planner_patch_instructionsに『今回のrunbookで扱う範囲』と"
+        "『後続調査へ送る範囲』を明確に分ける指示を書き、pass_conditionsにも縮小後の合格条件を書いてください。"
+        "完全なABI/既知問題調査が今回の範囲外なら、今回の回答では断定しない、根拠付きで保留する、後続runに送る、という形でpass可能にしてください。"
+        "人間レビューは最終手段です。AIがスコープ縮小、保留、後続調査化で安全に前進できるならhuman_decision_neededに入れないでください。"
+        "risk_pointsには、実機操作安全・権限・承認・ユーザーデータ・サービス影響・停止条件だけを入れてください。"
+        "technical_pointsには、調査設計・具体性・Knowledge/既知問題確認・回答根拠・手戻り防止だけを入れてください。"
+        "同じ内容がrisk/technical両方に出ている場合は、正しい側だけに寄せ、reviewer_conflictsにその整理を書いてください。"
+        "technical内容をriskに残したり、risk内容をtechnicalに残したりしないでください。"
+        "final_revise_requestsはrunbook生成エージェントが一回で直せる粒度で、重複なく、優先度順にしてください。"
+        "human-revision-requestがある場合は、Must Fixが満たされたかを確認し、未反映ならfinal_revise_requestsへ入れてください。"
+        "Nice To Fixだけではreviseにしないでください。"
+        "risk/technicalのどちらかがblockなら原則blockです。blockの理由はoperator_notesに明確に書いてください。"
+        "必ず指定JSONスキーマだけを返してください。"
+    )
+    payload = {
+        "run": {
+            "id": run.get("id"),
+            "ticket_id": run.get("ticket_id"),
+            "environment": run.get("environment"),
+            "machine": run.get("machine"),
+            "status": run.get("status"),
+            "summary": run.get("summary"),
+        },
+        "documents": _compact_run_documents(documents),
+        "risk_review": risk,
+        "technical_review": technical,
+    }
+    user = (
+        "# Chief review input\n"
+        f"{json.dumps(payload, ensure_ascii=False, indent=2)}\n\n"
+        "risk/technical査読を統合し、人間とrunbook生成エージェント向けの最終レビューJSONを返してください。"
+    )
+    candidates = runbook_model_candidates(model)
+    last_err: Optional[Exception] = None
+    for m in candidates:
+        try:
+            result = chat_json(
+                system,
+                user,
+                RUNBOOK_CHIEF_REVIEW_SCHEMA,
+                model=m,
+                schema_name="runbook_chief_review",
+                temperature=0.0,
+                max_tokens=4096,
+            )
+            result["_model"] = m
+            return result
+        except Exception as e:  # noqa: BLE001
+            last_err = e
+            continue
+    raise RuntimeError(f"全runbook chief評価モデルで失敗しました: {last_err}")
 
 
 if __name__ == "__main__":

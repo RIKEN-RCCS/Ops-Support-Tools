@@ -44,6 +44,9 @@ Zendesk の新規チケット一次トリアージ、追加質問への返信ド
 | `SUPPORT_AI_TRIAGE_SEARCH_QUERY` | polling 用 Zendesk Search query |
 | `SUPPORT_AI_KNOWLEDGE_API_URL` | Knowledge API の内部URL。設定時、環境確認が必要なtriageをrunへ送る |
 | `SUPPORT_AI_CREATE_KNOWLEDGE_RUNS` | `requires_runbook` / `requires_environment_knowledge` のtriageでKnowledge runを作る |
+| `SUPPORT_AI_RUNBOOK_WORKER_ENABLED` | `status=requested` の Knowledge run から runbook plan を生成する worker を有効化 |
+| `SUPPORT_AI_RUNBOOK_REVIEW_WORKER_ENABLED` | runbook plan の risk / technical / chief 評価 worker を有効化 |
+| `SUPPORT_AI_RUNBOOK_MAX_REVISIONS` | chief review からの自動 revise 上限。既定 `2` |
 | `SUPPORT_AI_WEBHOOK_TOKEN` / `SUPPORT_AI_WEBHOOK_TOKEN_FILE` | webhook 共有トークン。未設定なら認証チェックなし |
 | `SUPPORT_AI_QUEUE_KEY` / `SUPPORT_AI_QUEUE_KEY_FILE` | スプール JSON 暗号化キー。Docker では secrets/support_ai_queue_key を使う |
 | `LLM_BASE_URL` / `LLM_API_KEY` / `LLM_API_KEY_FILE` | OpenAI 互換 LLM endpoint |
@@ -52,6 +55,9 @@ Zendesk の新規チケット一次トリアージ、追加質問への返信ド
 | `SUPPORT_AI_RUNBOOK_MODEL` | runbook生成・実行結果整理向けの強めのモデル。未設定なら `SUPPORT_AI_MODEL` を使う |
 | `SUPPORT_AI_RUNBOOK_FALLBACK_MODELS` | runbook向けフォールバックモデル。カンマ区切り |
 | `SUPPORT_AI_CONTEXT` | LLM に渡すサポート対象の説明 |
+| `SUPPORT_AI_ENVIRONMENT_CANDIDATES` | triage AI が本文から推定してよい environment 候補。カンマ区切り |
+| `SUPPORT_AI_MACHINE_CANDIDATES` | triage AI が本文から推定してよい machine 候補。カンマ区切り |
+| `SUPPORT_AI_MACHINE_ALIAS_MAP` | machine の一意な表記ゆれを canonical 名へ正規化する JSON map |
 | `ZENDESK_URL` / `ZENDESK_EMAIL` / `ZENDESK_KEY` / `ZENDESK_KEY_FILE` | Zendesk API token 認証 |
 | `SUPPORT_AI_AGENTS_FILE` | 担当者名簿 JSON |
 | `SUPPORT_AI_STARTUP_CHECKS` | コンテナ起動時に preflight を実行する |
@@ -123,6 +129,34 @@ payload は次のいずれかの形なら受け付けます。
 {"ticket": {"id": 12345}}
 ```
 
+Zendesk trigger 側で対象環境や machine を判定できる場合は、次のように payload に含めます。webhook から明示された値は triage AI の文面推定より優先され、Knowledge run の metadata に保存されます。
+
+```json
+{"ticket_id": 12345, "environment": "production", "machine": "target-host-01"}
+```
+
+Zendesk 側で送れない場合、triage AI は `SUPPORT_AI_ENVIRONMENT_CANDIDATES` / `SUPPORT_AI_MACHINE_CANDIDATES` の候補内から本文で高確信に特定できるものだけを採用します。候補が複数あり迷う場合や本文根拠が弱い場合は metadata を空にし、公開返信は保留して対象環境を確認する質問を出します。
+
+machine は本来一意に決まるシステム名だけを扱います。表記ゆれは `SUPPORT_AI_MACHINE_ALIAS_MAP` で canonical 名へ正規化します。
+
+```text
+SUPPORT_AI_MACHINE_CANDIDATES=RIKYU,R-CCS Cloud
+SUPPORT_AI_MACHINE_ALIAS_MAP={"RIKYU":["理究","RIKYU","Rikyu","rikyu","りきゅう"],"R-CCS Cloud":["R-CCSクラウド","R-CCS Cloud"]}
+```
+
+`GH200` や `GB200` のような機種名・GPU名・構成名は、複数の別システムを指し得るため machine alias として登録しません。そのような語だけが本文にある場合、triage AI は machine を空にし、`ask_user`、`operator_select`、または `runbook_identify` に倒します。
+
+triage AI は対象特定の進め方を `target_resolution` として出します。
+
+| Value | Meaning |
+|---|---|
+| `identified_from_webhook` | Zendesk webhook payload の明示値を採用した。generator が補正して付与する |
+| `identified_from_text` | チケット本文から候補内の対象を高確信で特定した |
+| `ask_user` | ユーザーに対象環境/machineを聞き返すのが最短で安全 |
+| `operator_select` | 担当者がZendeskフォーム、タグ、運用文脈から選ぶべき |
+| `runbook_identify` | Knowledgeや既存チケット、実機に触れない範囲の調査で特定できそう |
+| `unknown_stop` | 対象不明のまま自動処理を止め、operator review に回すべき |
+
 `SUPPORT_AI_WEBHOOK_TOKEN` を設定した場合は、Zendesk webhook 側で次のどちらかのヘッダーを付けます。
 
 ```text
@@ -148,6 +182,43 @@ suggested_next_action
 `SUPPORT_AI_KNOWLEDGE_API_URL` が設定され、`SUPPORT_AI_CREATE_KNOWLEDGE_RUNS=1` の場合、`requires_runbook=true` または `requires_environment_knowledge=true` のtriageは Knowledge API に `status=requested` の run を作ります。run には初期runbookとして、既存知見確認、実機確認、リスク評価、findings / answer draft 登録の手順が入ります。同じ `ticket_id` に未完了の `requested` run が既にある場合は、runbook decision agent が「既存runへ文脈を attach するだけでよいか」「より深く/広く/作り直しの新規調査runが必要か」「runbook不要か」「担当者判断へ戻すか」を判定します。判定結果は `runbook-decision` document として Knowledge に残します。attach は同じrunbookの再実行を意味しません。
 
 Followup responder も同じゲートと decision agent を使います。公開会話履歴を LLM に渡すときは Zendesk user id / author_id を渡さず、`speaker=end_user` または `speaker=support` のみを使います。decision agent の `runbook_change` は `none`、`append_context`、`deepen`、`broaden`、`replace`、`initial` のいずれかです。
+
+## Runbook Worker
+
+`runbook-worker` service は Knowledge API の `status=requested` run を拾い、runbook向けモデルで実行前レビュー用の `runbook-plan` document を添付します。worker は実機操作、Zendesk投稿、公開返信を行いません。処理の流れは次の通りです。
+
+```text
+requested -> planning -> review_requested
+revision_requested -> planning -> review_requested
+```
+
+生成される document には、Knowledge 照会観点、読み取り系確認、risk review、人間承認理由、停止条件、`findings` / `issue_on_run` / `summary` / `answer_draft` のテンプレートを含めます。実機実行やユーザー返信は、この `planned` run を人間または後続AIが確認してから進めます。
+
+worker は LLM の出力後にも決定論的なガードを掛けます。run の `environment` または `machine` が未特定の場合は、`requires_human_approval=true`、`answer_draft_policy=hold` に補正し、公開返信案は findings 登録後に作るプレースホルダーへ戻します。`module load`、ビルド、インストール、設定変更、ジョブ投入、ユーザーデータ参照は、この plan だけでは承認済みになりません。確認済みでない module 名、MPI 実装名、configure/build option、自前ビルド推奨、管理者作業依頼は answer draft に入れない方針です。
+
+runbook の役割は一回で完全解決することではなく、問題解決に向けて着実に前進し、再利用できる知見を蓄積することです。chief review や revision request が広すぎる調査を要求している場合、worker は今回の runbook の scope を縮小し、今回確認する範囲、未確認として残す範囲、後続調査へ送る範囲を分けます。回答案も、その時点で確認済みの根拠から安全に言える範囲に限定します。
+
+## Runbook Review Worker
+
+`runbook-review-worker` service は `review_requested` の runbook plan を、実機実行前に risk / technical / chief の三段階評価へ通します。
+
+- `runbook-risk-review`: 実機操作に係る危険度だけを確認します。エージェントが範囲外操作をする余地、実行権限、ユーザーデータ参照、サービス影響、ロールバック、人間承認、停止条件が対象です。技術的な調査効率や既知問題の調べ方は扱いません。
+- `runbook-technical-review`: 調査コスト、効率、具体性、再利用性、過去知見・既知問題の活用、回答根拠の作りやすさを確認します。実行権限や破壊的操作などの実機安全性は risk review に任せます。
+- `runbook-chief-review`: risk / technical の査読結果と最新 runbook plan を読み、重複、矛盾、抜け漏れ、観点混在を整理します。人間と runbook worker が見る中心のレビューです。
+
+評価タイミングは runbook plan 生成直後です。risk / technical は専門査読として document に残りますが、最終判定は chief review が行います。chief が `pass` なら run は `review_passed` になり、人間または実機側AIの実行前確認へ進めます。chief が `revise` なら `runbook-revision-request` document を添付し、run を `revision_requested` に戻します。runbook worker は chief review と revision request を文脈として新しい `runbook-plan` を作ります。
+
+chief review は抽象的な指摘だけで終わらせません。次の項目を出し、runbook worker がそのまま次の plan に反映できる形へ整理します。
+
+- `Final Revise Requests`: 最終的な差し戻し事項。重複を除き、優先度順にまとめる。
+- `Planner Patch Instructions`: runbook のどの section に何を追加・置換するか。Knowledge Queries、Read-only Checks、Execution Steps、Findings Template、Summary Template、Answer Draft Skeleton へ展開できる粒度で書く。
+- `Evidence To Collect`: 実機AIまたは後続AIが集めるべき根拠。確認対象と期待する出力形式が分かる粒度で書く。
+- `Pass Conditions`: 次回レビューで pass してよい客観条件。
+- `Human Decision Needed`: 人間の運用判断が本当に必要なものだけ。AI/実機確認/後続調査化で進められるものは入れない。
+
+査読指摘を完全に満たすために調査範囲が膨らみすぎる場合、chief review は人間へ改訂を戻す前に、scope を縮小して通せる runbook にできるかを検討します。今回の runbook で扱う範囲、後続調査へ送る範囲、回答で断定しない範囲を明示すれば pass 可能にできます。人間レビューは最終手段です。
+
+revise は無限ループさせません。`SUPPORT_AI_RUNBOOK_MAX_REVISIONS` を超える差し戻しが必要な場合、run は `operator_review` で停止します。この場合も人間が改訂文を書く前提ではなく、縮小 runbook を承認するか、後続調査を開くか、真に運用判断が必要かを確認します。`block` 判定も同じく `operator_review` で止め、人間が方針を決めるまで自動再生成しません。
 
 ## Runbook LLM Evaluation
 
@@ -196,7 +267,7 @@ mkdir -p apps/zendesk-support-ai/secrets
 docker compose up --build
 ```
 
-リポジトリ root の `docker-compose.yml` は `webhook`、`generator`、`poster`、`followup`、`followup-responder` を非 root ユーザーで起動します。SQLite queue は app-local bind mount `apps/zendesk-support-ai/data:/data/queue`、設定は `apps/zendesk-support-ai/config:/config` を共有します。`config/agents.json` は初回作成時に `agents.example.json` 由来で作られ、起動時同期で更新されます。
+リポジトリ root の `docker-compose.yml` は `webhook`、`generator`、`poster`、`followup`、`followup-responder`、`runbook-worker`、`runbook-review-worker` を非 root ユーザーで起動します。SQLite queue は app-local bind mount `apps/zendesk-support-ai/data:/data/queue`、設定は `apps/zendesk-support-ai/config:/config` を共有します。`config/agents.json` は初回作成時に `agents.example.json` 由来で作られ、起動時同期で更新されます。
 
 `docker-compose.yml` はアプリ配下の `.env` を非機微設定として読みます。これはアプリごとに設定を分けるためです。秘密値は `.env` ではなく Compose secrets として `/run/secrets/...` に mount され、アプリは `*_FILE` 変数から読み込みます。これにより `docker compose config` の誤実行で API key/token 本体が標準出力に展開される事故を防ぎます。
 
