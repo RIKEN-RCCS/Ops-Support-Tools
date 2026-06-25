@@ -6,7 +6,7 @@ From: python:3.12-slim
     Description Runbook gateway CLI for Knowledge API handoff
 
 %files
-    runbook_gateway.py /opt/runbook-gateway/runbook_gateway.py
+    apps/runbook-gateway/runbook_gateway.py /opt/runbook-gateway/runbook_gateway.py
 
 %post
     chmod 755 /opt/runbook-gateway/runbook_gateway.py
