@@ -22,10 +22,14 @@ GET  /api/document-handoffs/{id}
 PATCH /api/document-handoffs/{id}
 POST /api/runs
 GET  /api/runs?status=requested
+POST /api/runs/claim
 GET  /api/runs/{id}
 PATCH /api/runs/{id}
 POST /api/runs/{id}/documents
 GET  /api/runs/{id}/documents
+POST /api/runs/{id}/execution-result
+POST /api/runs/{id}/claim/heartbeat
+POST /api/runs/{id}/claim/release
 ```
 
 ## Document Payload
@@ -160,3 +164,122 @@ Attach an output document to the run:
 Documents attached to a run inherit the run's `environment` and `machine` when those fields are omitted from the document payload.
 
 Suggested document roles are `findings`, `issue_on_run`, `summary`, `answer_draft`, and `operator_note`.
+
+Register execution results as a bundle:
+
+```json
+{
+  "source": "real-machine-agent",
+  "findings": "Confirmed facts, commands inspected, and evidence.",
+  "issue_on_run": "Remaining blockers or problems during execution.",
+  "summary": "Short handoff summary for the next reader.",
+  "answer_draft": "Draft text that may be returned to Zendesk after review.",
+  "answer_draft_policy": "hold",
+  "runbook_document_id": "runbook-plan-document-id",
+  "runbook_title": "Runbook title shown to operators",
+  "claim_token": "token printed by claim_run.py when status=executing",
+  "next_status": "operator_review",
+  "create_zendesk_handoff": false
+}
+```
+
+`POST /api/runs/{id}/execution-result` creates separate encrypted documents with roles/kinds `findings`, `issue_on_run`, `summary`, and `answer_draft` for the non-empty fields. It also updates the run-level encrypted `summary` and `issue_on_run` fields when those values are supplied. Include `runbook_document_id` and `runbook_title` when the results came from a specific `runbook-plan`; the web UI records these automatically from the latest plan.
+
+Valid `answer_draft_policy` values are `hold`, `internal_note`, and `public_reply_draft`. Valid `next_status` values are `operator_review`, `review_passed`, `closed`, and `no_change`. If `create_zendesk_handoff=true` and `answer_draft` is present, the API creates a `zendesk-draft` handoff for later review. It does not post to Zendesk.
+
+The run detail web page has the same registration form under **Register Execution Result**. Use it when a human operator has run the checks manually and wants to return findings, issues, a summary, and an answer draft to Knowledge without calling the API directly. The **Execution Results** panel shows which runbook produced each result document.
+
+## Runbook Execution Procedure
+
+Use this procedure when a human operator or real-machine AI receives a reviewed runbook.
+
+1. Claim the target run before starting work. This prevents multiple operators or agents from executing the same runbook at the same time.
+2. Open the target run detail page and confirm `environment`, `machine`, status, latest runbook plan, chief review, and stop conditions. The runbook plan shown under **Runbook Under Review** is the execution target unless an operator explicitly selects a different runbook document.
+3. Keep the lease alive while working. If the lease expires, another operator or agent may reclaim the run.
+4. Execute only the commands that are explicitly allowed by the runbook. Treat module changes, job submission, installation, file edits, service restarts, user data access, and destructive commands as out of scope unless the runbook and an operator approval both allow them.
+5. Stop immediately if the target machine is ambiguous, a command would exceed the stated scope, credentials or secrets would be exposed, or the result contradicts the runbook assumptions.
+6. Record evidence as short factual notes. Prefer command purpose and summarized output over large raw logs. Do not paste secrets, tokens, private user data, or unnecessary full command output.
+7. Register results from the run detail page or `POST /api/runs/{id}/execution-result`. Make sure the result registration points to the runbook document that was actually executed, so later reviewers can see which plan produced each finding. Claimed `executing` runs require the matching `claim_token` when registering results.
+
+### Claim / Lease
+
+Claim a `review_passed` run:
+
+```bash
+python3 apps/knowledge-api/claim_run.py claim \
+  --api http://127.0.0.1:18180 \
+  --claimant "$USER" \
+  --lease-seconds 1800
+```
+
+Claim a specific run:
+
+```bash
+python3 apps/knowledge-api/claim_run.py claim \
+  --api http://127.0.0.1:18180 \
+  --claimant "$USER" \
+  --run-id RUN_ID
+```
+
+Claim by target metadata:
+
+```bash
+python3 apps/knowledge-api/claim_run.py claim \
+  --api http://127.0.0.1:18180 \
+  --claimant cuda-mpi-agent \
+  --machine RIKYU \
+  --document-kind runbook-plan \
+  --document-tag cuda \
+  --lease-seconds 1800
+```
+
+Target filters are metadata-only: `ticket_id`, `environment`, `machine`, attached `document_kind`, `document_title_contains`, `document_source`, and `document_tag`. Encrypted document bodies are not searched. Use document tags such as `cuda`, `mpi`, `compiler`, `scheduler`, or machine-specific tags when creating runbook-plan documents so specialized agents can claim suitable work.
+
+The command prints a `claim_token`. Keep it for heartbeat, release, and execution-result registration. Do not put it in documents or Zendesk comments.
+
+Extend the lease:
+
+```bash
+python3 apps/knowledge-api/claim_run.py heartbeat \
+  --api http://127.0.0.1:18180 \
+  --run-id RUN_ID \
+  --claim-token CLAIM_TOKEN \
+  --lease-seconds 1800
+```
+
+Release without completing:
+
+```bash
+python3 apps/knowledge-api/claim_run.py release \
+  --api http://127.0.0.1:18180 \
+  --run-id RUN_ID \
+  --claim-token CLAIM_TOKEN \
+  --next-status review_passed
+```
+
+After registering execution results, use `operator_review`, `closed`, or `execution_failed` as appropriate. The execution-result API clears the claim when a claimed run is moved out of `executing`.
+
+Direct API claim request:
+
+```json
+{
+  "claimant": "operator-name",
+  "status": "review_passed",
+  "environment": "production",
+  "machine": "RIKYU",
+  "document_kind": "runbook-plan",
+  "document_tag": "cuda",
+  "lease_seconds": 1800
+}
+```
+
+Execution result fields:
+
+| Field | Purpose |
+|---|---|
+| `findings` | Confirmed facts, read-only checks performed, summarized evidence, and what was not checked |
+| `issue_on_run` | Problems during execution, blocked steps, scope violations avoided, ambiguity, or `none` if no issue occurred |
+| `summary` | Short handoff summary for the next support person or AI |
+| `answer_draft` | Draft text for Zendesk or an internal note; keep `answer_draft_policy=hold` unless it is ready for review |
+
+Recommended status after registration is `operator_review` when a human should review the findings or answer draft. Use `closed` only when the run is complete and no follow-up action remains. Creating a `zendesk-draft` handoff queues a draft for later review; it still does not post to Zendesk.

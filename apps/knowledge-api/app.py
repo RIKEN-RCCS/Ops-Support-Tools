@@ -24,6 +24,7 @@ RUN_STATUS_HELP = (
     "requested=plan生成待ち、planning=plan生成中、review_requested=risk/technical評価待ち、"
     "risk_reviewing=risk評価中、technical_reviewing=technical評価中、"
     "revision_requested=plan差し戻し、review_passed=評価通過、"
+    "executing=実行claim中、execution_failed=実行失敗、"
     "operator_review=人間判断待ち、closed=終了、superseded=別runに統合済み"
 )
 
@@ -52,6 +53,8 @@ a { color: #145dbf; }
 .badge-review_requested, .badge-risk_reviewing, .badge-technical_reviewing { background: #e6f0ff; color: #174a8b; }
 .badge-planned { background: #dff3e4; color: #1f6b35; }
 .badge-review_passed { background: #d4f3dc; color: #166233; }
+.badge-executing { background: #dceeff; color: #124f84; }
+.badge-execution_failed { background: #fde2e1; color: #8a1c13; }
 .badge-revision_requested { background: #fff0d6; color: #7a4a00; }
 .badge-operator_review { background: #fde2e1; color: #8a1c13; }
 .badge-closed { background: #eceff3; color: #59636e; }
@@ -240,6 +243,11 @@ def _init_db() -> None:
               environment TEXT NOT NULL DEFAULT '',
               machine TEXT NOT NULL DEFAULT '',
               status TEXT NOT NULL DEFAULT 'created',
+              claimed_by TEXT NOT NULL DEFAULT '',
+              claim_token TEXT NOT NULL DEFAULT '',
+              claimed_at INTEGER NOT NULL DEFAULT 0,
+              lease_until INTEGER NOT NULL DEFAULT 0,
+              attempt_count INTEGER NOT NULL DEFAULT 0,
               issue_on_run TEXT NOT NULL DEFAULT '',
               issue_on_run_ciphertext TEXT NOT NULL DEFAULT '',
               summary TEXT NOT NULL DEFAULT '',
@@ -285,6 +293,11 @@ def _init_db() -> None:
         _ensure_column(conn, "runs", "summary_ciphertext", "TEXT NOT NULL DEFAULT ''")
         _ensure_column(conn, "runs", "environment", "TEXT NOT NULL DEFAULT ''")
         _ensure_column(conn, "runs", "machine", "TEXT NOT NULL DEFAULT ''")
+        _ensure_column(conn, "runs", "claimed_by", "TEXT NOT NULL DEFAULT ''")
+        _ensure_column(conn, "runs", "claim_token", "TEXT NOT NULL DEFAULT ''")
+        _ensure_column(conn, "runs", "claimed_at", "INTEGER NOT NULL DEFAULT 0")
+        _ensure_column(conn, "runs", "lease_until", "INTEGER NOT NULL DEFAULT 0")
+        _ensure_column(conn, "runs", "attempt_count", "INTEGER NOT NULL DEFAULT 0")
         _ensure_column(conn, "document_handoffs", "note_ciphertext", "TEXT NOT NULL DEFAULT ''")
         _ensure_column(conn, "document_handoffs", "environment", "TEXT NOT NULL DEFAULT ''")
         _ensure_column(conn, "document_handoffs", "machine", "TEXT NOT NULL DEFAULT ''")
@@ -314,7 +327,7 @@ def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
     return data
 
 
-def _run_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+def _run_row_to_dict(row: sqlite3.Row, *, include_claim_token: bool = False) -> dict[str, Any]:
     data = dict(row)
     data["runbook"] = _decrypt_field(data.get("runbook_ciphertext", ""), data.get("runbook", ""))
     data["issue_on_run"] = _decrypt_field(data.get("issue_on_run_ciphertext", ""), data.get("issue_on_run", ""))
@@ -322,6 +335,8 @@ def _run_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
     data.pop("runbook_ciphertext", None)
     data.pop("issue_on_run_ciphertext", None)
     data.pop("summary_ciphertext", None)
+    if not include_claim_token:
+        data.pop("claim_token", None)
     return data
 
 
@@ -687,6 +702,8 @@ def web_runs():
             <a href="{{ link('web_runs', status='technical_reviewing') }}" title="technical評価AIが確認中の調査run">technical reviewing</a>
             <a href="{{ link('web_runs', status='revision_requested') }}" title="risk/technical評価からplan修正へ差し戻された調査run">revision requested</a>
             <a href="{{ link('web_runs', status='review_passed') }}" title="risk/technical評価を通過した調査run">review passed</a>
+            <a href="{{ link('web_runs', status='executing') }}" title="実機AIまたは人間がclaimして実行中の調査run">executing</a>
+            <a href="{{ link('web_runs', status='execution_failed') }}" title="実行失敗として停止した調査run">execution failed</a>
             <a href="{{ link('web_runs', status='operator_review') }}" title="自動処理では進めず、人間の判断が必要な調査run">operator review</a>
           </div>
           <div class="meta">Runs are investigation threads and status trackers. The actual texts live in attached Documents: runbook-plan, runbook-risk-review, runbook-technical-review, runbook-revision-request, findings, issue_on_run, summary, and answer_draft.</div>
@@ -707,7 +724,7 @@ def web_runs():
               <td>{{ run.ticket_id or "" }}</td>
               <td>{{ run.environment }}</td>
               <td>{{ run.machine }}</td>
-              <td><span class="badge badge-{{ run.status }}" title="{{ run_status_help }}">{{ run.status }}</span></td>
+              <td><span class="badge badge-{{ run.status }}" title="{{ run_status_help }}">{{ run.status }}</span>{% if run.claimed_by %}<br><span class="meta">claimed by {{ run.claimed_by }} until {{ fmt(run.lease_until) }}</span>{% endif %}</td>
               <td>{{ run.summary }}</td>
               <td>{{ run.document_count }}</td>
               <td>{{ run.document_kinds }}</td>
@@ -823,6 +840,35 @@ def _document_label(document: dict[str, Any] | None) -> str:
     return f"{role} / {kind}" if role else kind
 
 
+def _markdown_body_without_leading_meta(body_md: str) -> str:
+    lines = body_md.splitlines()
+    start = 0
+    if lines and lines[0].startswith("#"):
+        start = 1
+    meta_keys = {
+        "at",
+        "source_run_id",
+        "ticket_id",
+        "environment",
+        "machine",
+        "runbook_document_id",
+        "runbook_title",
+        "answer_draft_policy",
+    }
+    while start < len(lines):
+        line = lines[start].strip()
+        if not line:
+            start += 1
+            continue
+        if line.startswith("- ") and ":" in line:
+            key = line[2:].split(":", 1)[0].strip()
+            if key in meta_keys:
+                start += 1
+                continue
+        break
+    return "\n".join(lines[start:]).strip()
+
+
 def _run_review_focus(documents: list[dict[str, Any]]) -> dict[str, Any]:
     latest_plan = _latest_document(documents, "runbook-plan")
     latest_risk = _latest_document(documents, "runbook-risk-review")
@@ -883,6 +929,43 @@ def _run_review_focus(documents: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _run_execution_results(run: dict[str, Any], documents: list[dict[str, Any]]) -> dict[str, Any]:
+    latest_plan = _latest_document(documents, "runbook-plan")
+    result_docs = [
+        doc
+        for doc in documents
+        if str(doc.get("kind") or "") in EXECUTION_RESULT_FIELDS
+           or str(doc.get("role") or "") in EXECUTION_RESULT_FIELDS
+    ]
+    result_docs.sort(key=lambda doc: int(doc.get("linked_at") or doc.get("created_at") or 0), reverse=True)
+
+    cards: list[dict[str, Any]] = []
+    for doc in result_docs:
+        body = str(doc.get("body_md") or "")
+        runbook_document_id = _markdown_meta(body, "runbook_document_id")
+        runbook_title = _markdown_meta(body, "runbook_title")
+        if not runbook_document_id and latest_plan:
+            runbook_document_id = str(latest_plan.get("id") or "")
+            runbook_title = str(latest_plan.get("title") or runbook_title)
+        if not runbook_title:
+            runbook_title = "Inline runbook" if not latest_plan else str(latest_plan.get("title") or "Runbook plan")
+        cards.append({
+            "document": doc,
+            "label": _document_label(doc),
+            "points": _brief_items(_markdown_body_without_leading_meta(body), limit=4, width=260),
+            "runbook_document_id": runbook_document_id,
+            "runbook_title": runbook_title,
+            "runbook_source": "document" if runbook_document_id else "inline",
+        })
+
+    return {
+        "latest_plan": latest_plan,
+        "latest_plan_label": _document_label(latest_plan),
+        "latest_plan_body": str((latest_plan or {}).get("body_md") or run.get("runbook") or ""),
+        "cards": cards,
+    }
+
+
 @app.get("/runs/<run_id>/view")
 @app.get("/knowledge/runs/<run_id>/view")
 def web_run_detail(run_id: str):
@@ -910,12 +993,16 @@ def web_run_detail(run_id: str):
         doc["body_md"] = _document_body(row)
         documents.append(doc)
     review_focus = _run_review_focus(documents)
+    execution_results = _run_execution_results(run, documents)
     return _render(
         f"Run {run_id}",
         """
         <h1>Run {{ run.id }}</h1>
         <div class="panel">
           <div class="meta">ticket={{ run.ticket_id or "" }} environment={{ run.environment }} machine={{ run.machine }} status=<span class="badge badge-{{ run.status }}" title="{{ run_status_help }}">{{ run.status }}</span> updated={{ fmt(run.updated_at) }}</div>
+          {% if run.claimed_by %}
+          <div class="meta">claim={{ run.claimed_by }} lease_until={{ fmt(run.lease_until) }} attempt={{ run.attempt_count }}</div>
+          {% endif %}
           <p>{{ run.summary }}</p>
           <div class="quick-links">
             {% for doc in documents %}
@@ -1078,6 +1165,38 @@ def web_run_detail(run_id: str):
           <p class="meta">runbook planがまだ添付されていません。</p>
           {% endif %}
         </div>
+        <div class="panel">
+          <h2>Execution Results</h2>
+          <div class="meta">どのrunbookを実行して何が分かったかを見る場所です。各カードは実行結果documentで、対象runbookと要点を一緒に表示します。</div>
+          {% if execution_results.cards %}
+            <div class="review-columns">
+              {% for result in execution_results.cards %}
+              <section class="review-point-card">
+                <h3>{{ result.document.kind }}</h3>
+                <div class="meta">
+                  result: <a href="{{ link('web_document_detail', doc_id=result.document.id) }}">{{ result.label }}</a><br>
+                  runbook:
+                  {% if result.runbook_document_id %}
+                    <a href="{{ link('web_document_detail', doc_id=result.runbook_document_id) }}">{{ result.runbook_title }}</a>
+                  {% else %}
+                    {{ result.runbook_title }} <span class="badge">inline</span>
+                  {% endif %}
+                  <br>source={{ result.document.source }} linked={{ fmt(result.document.linked_at) }}
+                </div>
+                {% if result.points %}
+                <ul class="issue-list">
+                  {% for item in result.points %}
+                    <li>{{ item }}</li>
+                  {% endfor %}
+                </ul>
+                {% endif %}
+              </section>
+              {% endfor %}
+            </div>
+          {% else %}
+            <p class="meta">まだ実行結果は登録されていません。runbook実行後に Register Execution Result から findings / issue_on_run / summary / answer_draft を登録してください。</p>
+          {% endif %}
+        </div>
         {% if run.status == "operator_review" %}
         <div class="panel danger">
           <h2>Operator Actions</h2>
@@ -1132,6 +1251,42 @@ def web_run_detail(run_id: str):
         {% endif %}
         <h2>Runbook</h2>
         <pre>{{ run.runbook }}</pre>
+        {% if run.status != "closed" %}
+        <div class="panel">
+          <h2>Register Execution Result</h2>
+          <div class="meta">実機AI/実機作業者がrunbook実行後の成果をKnowledgeへ戻す入口です。入力された本文は種別ごとに暗号化documentとしてrunへ添付されます。</div>
+          <form method="post" action="{{ link('web_run_operator_action', run_id=run.id) }}">
+            <input type="hidden" name="action" value="register_execution_result">
+            <input type="hidden" name="runbook_document_id" value="{{ execution_results.latest_plan.id if execution_results.latest_plan else '' }}">
+            <input type="hidden" name="runbook_title" value="{{ execution_results.latest_plan.title if execution_results.latest_plan else 'Inline runbook' }}">
+            <div class="form-grid">
+              <label>Source<br><input name="source" value="knowledge-ui"></label>
+              <label>Claim token<br><input name="claim_token" placeholder="claimed runの場合は必須"></label>
+              <label>Next status<br>
+                <select name="next_status">
+                  <option value="operator_review">operator_review</option>
+                  <option value="review_passed">review_passed</option>
+                  <option value="no_change">no_change</option>
+                  <option value="closed">closed</option>
+                </select>
+              </label>
+              <label>Answer draft policy<br>
+                <select name="answer_draft_policy">
+                  <option value="hold">hold</option>
+                  <option value="internal_note">internal_note</option>
+                  <option value="public_reply_draft">public_reply_draft</option>
+                </select>
+              </label>
+            </div>
+            <label>Findings<br><textarea name="findings" placeholder="確認した事実、実行したread-only check、根拠、ログ要約"></textarea></label>
+            <label>Issue On Run<br><textarea name="issue_on_run" placeholder="実行中に起きた問題、未確認事項、止めた理由。問題がなければ空でよい"></textarea></label>
+            <label>Summary<br><textarea name="summary" placeholder="このrunで分かったこと、次に見る人への短いまとめ"></textarea></label>
+            <label>Answer Draft<br><textarea name="answer_draft" placeholder="Zendeskへ戻す候補文。未確認なら保留理由を書く"></textarea></label>
+            <label><input type="checkbox" name="create_zendesk_handoff" value="1"> Create zendesk-draft handoff from answer draft</label>
+            <div class="form-actions"><button type="submit">Register Result</button></div>
+          </form>
+        </div>
+        {% endif %}
         <h2>Issue On Run</h2>
         <pre>{{ run.issue_on_run }}</pre>
         <h2>Documents</h2>
@@ -1153,6 +1308,7 @@ def web_run_detail(run_id: str):
         run=run,
         documents=documents,
         review_focus=review_focus,
+        execution_results=execution_results,
         fmt=_fmt_ts,
         run_status_help=RUN_STATUS_HELP,
     )
@@ -1168,6 +1324,29 @@ def _attach_operator_note(
     kind: str = "operator-note",
     tags: list[str] | None = None,
 ) -> dict[str, Any]:
+    return _attach_run_document(
+        run,
+        title=title,
+        summary=summary,
+        body_md=body_md,
+        role=role,
+        kind=kind,
+        tags=tags or ["operator-note"],
+        source="knowledge-ui",
+    )
+
+
+def _attach_run_document(
+    run: dict[str, Any],
+    *,
+    title: str,
+    summary: str,
+    body_md: str,
+    role: str,
+    kind: str,
+    tags: list[str] | None = None,
+    source: str = "knowledge-ui",
+) -> dict[str, Any]:
     payload = {
         "role": role,
         "ticket_id": run.get("ticket_id"),
@@ -1175,8 +1354,8 @@ def _attach_operator_note(
         "title": title,
         "summary": summary,
         "body_md": body_md,
-        "tags": tags or ["operator-note"],
-        "source": "knowledge-ui",
+        "tags": tags or [role, kind],
+        "source": source,
         "environment": run.get("environment") or "",
         "machine": run.get("machine") or "",
     }
@@ -1191,6 +1370,157 @@ def _attach_operator_note(
         )
         conn.execute("UPDATE runs SET updated_at = ? WHERE id = ?", (_now(), run["id"]))
     return document
+
+
+EXECUTION_RESULT_FIELDS = {
+    "findings": {
+        "heading": "Findings",
+        "summary": "Runbook execution findings were registered.",
+        "tags": ["run-output", "findings"],
+    },
+    "issue_on_run": {
+        "heading": "Issue On Run",
+        "summary": "Runbook execution issues or remaining blockers were registered.",
+        "tags": ["run-output", "issue-on-run"],
+    },
+    "summary": {
+        "heading": "Summary",
+        "summary": "Runbook execution summary was registered.",
+        "tags": ["run-output", "summary"],
+    },
+    "answer_draft": {
+        "heading": "Answer Draft",
+        "summary": "Answer draft from runbook execution was registered.",
+        "tags": ["run-output", "answer-draft"],
+    },
+}
+
+
+def _validate_claim_for_execution_result(run: dict[str, Any], payload: dict[str, Any]) -> bool:
+    if run.get("status") != "executing" or not run.get("claim_token"):
+        return False
+    token = str(payload.get("claim_token") or "").strip()
+    if not token:
+        raise ValueError("claim_token is required for claimed executing runs")
+    if token != str(run.get("claim_token") or ""):
+        raise ValueError("claim_token mismatch")
+    if int(run.get("lease_until") or 0) <= _now():
+        raise ValueError("claim lease expired")
+    return True
+
+
+def _register_execution_result(
+    run: dict[str, Any],
+    payload: dict[str, Any],
+    *,
+    source: str = "knowledge-ui",
+) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+    values = {
+        field: str(payload.get(field) or "").strip()
+        for field in EXECUTION_RESULT_FIELDS
+    }
+    if not any(values.values()):
+        raise ValueError("at least one execution result field is required")
+
+    answer_policy = str(payload.get("answer_draft_policy") or "hold").strip() or "hold"
+    if answer_policy not in {"hold", "internal_note", "public_reply_draft"}:
+        answer_policy = "hold"
+    next_status = str(payload.get("next_status") or "").strip()
+    if next_status and next_status != "no_change" and next_status not in {"operator_review", "review_passed", "closed", "execution_failed"}:
+        raise ValueError("next_status must be operator_review, review_passed, closed, execution_failed, or no_change")
+    claim_validated = _validate_claim_for_execution_result(run, payload)
+    runbook_document_id = str(payload.get("runbook_document_id") or "").strip()
+    runbook_title = str(payload.get("runbook_title") or "").strip()
+
+    documents: list[dict[str, Any]] = []
+    now_text = _fmt_ts(_now())
+    for field, value in values.items():
+        if not value:
+            continue
+        spec = EXECUTION_RESULT_FIELDS[field]
+        title = f"{spec['heading']} for run {run['id']}"
+        body = (
+            f"# {spec['heading']}\n\n"
+            f"- at: {now_text}\n"
+            f"- source_run_id: {run['id']}\n"
+            f"- ticket_id: {run.get('ticket_id') or ''}\n"
+            f"- environment: {run.get('environment') or ''}\n"
+            f"- machine: {run.get('machine') or ''}\n"
+            f"- runbook_document_id: {runbook_document_id}\n"
+            f"- runbook_title: {runbook_title}\n"
+        )
+        if field == "answer_draft":
+            body += f"- answer_draft_policy: {answer_policy}\n"
+        body += f"\n{value}\n"
+        documents.append(
+            _attach_run_document(
+                run,
+                title=title,
+                summary=spec["summary"],
+                body_md=body,
+                role=field,
+                kind=field,
+                tags=list(spec["tags"]),
+                source=source,
+            )
+        )
+
+    updates: dict[str, Any] = {}
+    if values["summary"]:
+        updates.update({"summary": "", "_summary_plain": values["summary"]})
+    if values["issue_on_run"]:
+        updates.update({"issue_on_run": "", "_issue_plain": values["issue_on_run"]})
+    if next_status and next_status != "no_change":
+        updates["status"] = next_status
+        if claim_validated and next_status != "executing":
+            updates.update({
+                "claimed_by": "",
+                "claim_token": "",
+                "claimed_at": 0,
+                "lease_until": 0,
+            })
+    if updates:
+        _update_run_fields(run["id"], updates)
+
+    handoff: dict[str, Any] | None = None
+    create_handoff = payload.get("create_zendesk_handoff") in {True, "1", "true", "yes", "on"}
+    if create_handoff and values["answer_draft"]:
+        answer_doc = next((doc for doc in reversed(documents) if doc.get("kind") == "answer_draft"), None)
+        if answer_doc:
+            handoff_id = str(uuid.uuid4())
+            note = "Answer draft registered from runbook execution; review before posting to Zendesk."
+            now = _now()
+            with _connect() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO document_handoffs
+                      (id, document_id, ticket_id, environment, machine, channel, recipient, status, note, note_ciphertext, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        handoff_id,
+                        answer_doc["id"],
+                        run.get("ticket_id"),
+                        run.get("environment") or "",
+                        run.get("machine") or "",
+                        "zendesk-draft",
+                        "support-agent",
+                        "requested",
+                        "",
+                        field_crypto.encrypt_text(note),
+                        now,
+                        now,
+                    ),
+                )
+            handoff = {
+                "id": handoff_id,
+                "document_id": answer_doc["id"],
+                "channel": "zendesk-draft",
+                "recipient": "support-agent",
+                "status": "requested",
+            }
+
+    return documents, handoff
 
 
 def _update_run_fields(run_id: str, updates: dict[str, Any]) -> None:
@@ -1217,7 +1547,7 @@ def web_run_operator_action(run_id: str):
         row = conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
     if not row:
         return _render("Run not found", "<h1>Run not found</h1>"), 404
-    run = _run_row_to_dict(row)
+    run = _run_row_to_dict(row, include_claim_token=True)
     action = str(request.form.get("action") or "").strip()
     note = str(request.form.get("note") or "").strip()
     now_text = _fmt_ts(_now())
@@ -1356,6 +1686,44 @@ def web_run_operator_action(run_id: str):
             "issue_on_run": "",
             "_issue_plain": note,
         })
+    elif action == "register_execution_result":
+        source = str(request.form.get("source") or "knowledge-ui").strip() or "knowledge-ui"
+        try:
+            documents, handoff = _register_execution_result(
+                run,
+                {
+                    "findings": request.form.get("findings"),
+                    "issue_on_run": request.form.get("issue_on_run"),
+                    "summary": request.form.get("summary"),
+                    "answer_draft": request.form.get("answer_draft"),
+                    "answer_draft_policy": request.form.get("answer_draft_policy"),
+                    "runbook_document_id": request.form.get("runbook_document_id"),
+                    "runbook_title": request.form.get("runbook_title"),
+                    "claim_token": request.form.get("claim_token"),
+                    "next_status": request.form.get("next_status"),
+                    "create_zendesk_handoff": request.form.get("create_zendesk_handoff"),
+                },
+                source=source,
+            )
+        except ValueError as exc:
+            return _json_error(str(exc), 400)
+        registered = ", ".join(str(doc.get("kind") or doc.get("id")) for doc in documents)
+        handoff_line = f"\n- zendesk_handoff_id: {handoff['id']}" if handoff else ""
+        _attach_operator_note(
+            run,
+            title=f"Execution result registered for run {run_id}",
+            summary=f"Execution result documents registered: {registered}",
+            body_md=(
+                "# Execution Result Registration\n\n"
+                f"- at: {now_text}\n"
+                f"- source: {source}\n"
+                f"- documents: {registered or 'none'}"
+                f"{handoff_line}\n"
+            ),
+            role="operator_note",
+            kind="execution-result-registration",
+            tags=["operator-note", "execution-result", source],
+        )
     else:
         return _json_error("unknown operator action", 400)
     return redirect(_web_url("web_run_detail", run_id=run_id))
@@ -1845,6 +2213,180 @@ def get_run(run_id: str):
     return jsonify({"ok": True, "run": _run_row_to_dict(row)})
 
 
+def _lease_seconds(value: Any) -> int:
+    try:
+        seconds = int(value)
+    except (TypeError, ValueError):
+        seconds = 1800
+    return min(max(seconds, 60), 86400)
+
+
+@app.post("/api/runs/claim")
+def claim_run():
+    _init_db()
+    payload = request.get_json(silent=True) or {}
+    claimant = str(payload.get("claimant") or payload.get("claimed_by") or "").strip()
+    if not claimant:
+        return _json_error("claimant is required", 400)
+    run_id = str(payload.get("run_id") or "").strip()
+    status = str(payload.get("status") or "review_passed").strip() or "review_passed"
+    ticket_id = payload.get("ticket_id")
+    environment = str(payload.get("environment") or "").strip()
+    machine = str(payload.get("machine") or "").strip()
+    summary_contains = str(payload.get("summary_contains") or "").strip()
+    document_kind = str(payload.get("document_kind") or "").strip()
+    document_title_contains = str(payload.get("document_title_contains") or "").strip()
+    document_source = str(payload.get("document_source") or "").strip()
+    document_tag = str(payload.get("document_tag") or "").strip()
+    lease_seconds = _lease_seconds(payload.get("lease_seconds"))
+    now = _now()
+    token = str(uuid.uuid4())
+
+    filters = [
+        """
+        (
+          (status = :status AND (claim_token = '' OR lease_until <= :now))
+          OR (status = 'executing' AND lease_until <= :now AND :status = 'review_passed')
+        )
+        """
+    ]
+    params: dict[str, Any] = {"status": status, "now": now}
+    if run_id:
+        filters.append("id = :run_id")
+        params["run_id"] = run_id
+    if ticket_id not in (None, ""):
+        filters.append("ticket_id = :ticket_id")
+        params["ticket_id"] = ticket_id
+    if environment:
+        filters.append("environment = :environment")
+        params["environment"] = environment
+    if machine:
+        filters.append("machine = :machine")
+        params["machine"] = machine
+    if summary_contains:
+        filters.append("summary LIKE :summary_contains")
+        params["summary_contains"] = f"%{summary_contains}%"
+    doc_filters: list[str] = []
+    if document_kind:
+        doc_filters.append("d.kind = :document_kind")
+        params["document_kind"] = document_kind
+    if document_title_contains:
+        doc_filters.append("d.title LIKE :document_title_contains")
+        params["document_title_contains"] = f"%{document_title_contains}%"
+    if document_source:
+        doc_filters.append("d.source = :document_source")
+        params["document_source"] = document_source
+    if document_tag:
+        doc_filters.append("d.tags_json LIKE :document_tag")
+        params["document_tag"] = f"%{json.dumps(document_tag, ensure_ascii=False)[1:-1]}%"
+    if doc_filters:
+        filters.append(
+            """
+            EXISTS (
+              SELECT 1
+              FROM run_documents rd
+              JOIN documents d ON d.id = rd.document_id
+              WHERE rd.run_id = runs.id
+                AND """
+            + " AND ".join(doc_filters)
+            + "\n            )"
+        )
+    where = " AND ".join(filters)
+
+    with _connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            f"""
+            SELECT *
+            FROM runs
+            WHERE {where}
+            ORDER BY updated_at ASC
+            LIMIT 1
+            """,
+            params,
+        ).fetchone()
+        if not row:
+            conn.rollback()
+            return _json_error("no claimable run", 404)
+        lease_until = now + lease_seconds
+        conn.execute(
+            """
+            UPDATE runs
+            SET status = 'executing',
+                claimed_by = ?,
+                claim_token = ?,
+                claimed_at = ?,
+                lease_until = ?,
+                attempt_count = attempt_count + 1,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (claimant, token, now, lease_until, now, row["id"]),
+        )
+        updated = conn.execute("SELECT * FROM runs WHERE id = ?", (row["id"],)).fetchone()
+        conn.commit()
+    return jsonify({"ok": True, "run": _run_row_to_dict(updated), "claim_token": token})
+
+
+@app.post("/api/runs/<run_id>/claim/heartbeat")
+def heartbeat_run_claim(run_id: str):
+    _init_db()
+    payload = request.get_json(silent=True) or {}
+    token = str(payload.get("claim_token") or "").strip()
+    if not token:
+        return _json_error("claim_token is required", 400)
+    now = _now()
+    lease_until = now + _lease_seconds(payload.get("lease_seconds"))
+    with _connect() as conn:
+        cur = conn.execute(
+            """
+            UPDATE runs
+            SET lease_until = ?, updated_at = ?
+            WHERE id = ?
+              AND claim_token = ?
+              AND status = 'executing'
+              AND lease_until > ?
+            """,
+            (lease_until, now, run_id, token, now),
+        )
+        if cur.rowcount == 0:
+            return _json_error("claim not found, token mismatch, or lease expired", 409)
+        row = conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
+    return jsonify({"ok": True, "run": _run_row_to_dict(row)})
+
+
+@app.post("/api/runs/<run_id>/claim/release")
+def release_run_claim(run_id: str):
+    _init_db()
+    payload = request.get_json(silent=True) or {}
+    token = str(payload.get("claim_token") or "").strip()
+    if not token:
+        return _json_error("claim_token is required", 400)
+    next_status = str(payload.get("next_status") or "review_passed").strip() or "review_passed"
+    if next_status not in {"review_passed", "operator_review", "closed", "execution_failed"}:
+        return _json_error("next_status must be review_passed, operator_review, closed, or execution_failed", 400)
+    now = _now()
+    with _connect() as conn:
+        cur = conn.execute(
+            """
+            UPDATE runs
+            SET status = ?,
+                claimed_by = '',
+                claim_token = '',
+                claimed_at = 0,
+                lease_until = 0,
+                updated_at = ?
+            WHERE id = ?
+              AND claim_token = ?
+            """,
+            (next_status, now, run_id, token),
+        )
+        if cur.rowcount == 0:
+            return _json_error("claim not found or token mismatch", 409)
+        row = conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
+    return jsonify({"ok": True, "run": _run_row_to_dict(row)})
+
+
 @app.patch("/api/runs/<run_id>")
 def update_run(run_id: str):
     _init_db()
@@ -1913,6 +2455,32 @@ def create_run_document(run_id: str):
             "run": _run_row_to_dict(updated_run),
             "document": document,
             "link": {"run_id": run_id, "document_id": document["id"], "role": role},
+        }
+    ), 201
+
+
+@app.post("/api/runs/<run_id>/execution-result")
+def create_run_execution_result(run_id: str):
+    _init_db()
+    payload = request.get_json(silent=True) or {}
+    with _connect() as conn:
+        run_row = conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
+    if not run_row:
+        return _json_error("run not found", 404)
+    run = _run_row_to_dict(run_row, include_claim_token=True)
+    source = str(payload.get("source") or "real-machine-agent").strip() or "real-machine-agent"
+    try:
+        documents, handoff = _register_execution_result(run, payload, source=source)
+    except ValueError as exc:
+        return _json_error(str(exc), 400)
+    with _connect() as conn:
+        updated_run = conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
+    return jsonify(
+        {
+            "ok": True,
+            "run": _run_row_to_dict(updated_run),
+            "documents": documents,
+            "handoff": handoff,
         }
     ), 201
 
