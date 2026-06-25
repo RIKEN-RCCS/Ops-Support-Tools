@@ -205,7 +205,26 @@ def _find_comment_id(payload: Any) -> Optional[int]:
     return None
 
 
-def enqueue_ticket(ticket_id: int, *, source: str = "webhook") -> bool:
+def _find_context_value(payload: Any, key: str) -> str:
+    """Zendesk webhook payload から environment/machine 等の短い文脈値を抽出する。"""
+    if not isinstance(payload, dict):
+        return ""
+    candidates = [
+        payload.get(key),
+        (payload.get("ticket") or {}).get(key) if isinstance(payload.get("ticket"), dict) else None,
+        (payload.get("detail") or {}).get(key) if isinstance(payload.get("detail"), dict) else None,
+        (payload.get("context") or {}).get(key) if isinstance(payload.get("context"), dict) else None,
+    ]
+    for value in candidates:
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text:
+            return text[:120]
+    return ""
+
+
+def enqueue_ticket(ticket_id: int, *, source: str = "webhook", environment: str = "", machine: str = "") -> bool:
     """ticket_id を incoming/ に冪等に積む。新規作成したら True。"""
     common.ensure_spool_dirs()
     name = f"ticket_{ticket_id}.json"
@@ -216,6 +235,8 @@ def enqueue_ticket(ticket_id: int, *, source: str = "webhook") -> bool:
         "ticket_id": int(ticket_id),
         "received_at": int(time.time()),
         "source": source,
+        "environment": environment,
+        "machine": machine,
     }
     common.atomic_write_json(target, event)
     return True
@@ -348,8 +369,16 @@ def zendesk_triage_webhook():
     ticket_id = _find_ticket_id(payload)
     if ticket_id is None:
         return jsonify({"ok": False, "error": "ticket_id not found"}), 400
-    queued = enqueue_ticket(ticket_id)
-    return jsonify({"ok": True, "ticket_id": ticket_id, "queued": queued})
+    environment = _find_context_value(payload, "environment")
+    machine = _find_context_value(payload, "machine")
+    queued = enqueue_ticket(ticket_id, environment=environment, machine=machine)
+    return jsonify({
+        "ok": True,
+        "ticket_id": ticket_id,
+        "queued": queued,
+        "environment": environment,
+        "machine": machine,
+    })
 
 
 @app.post("/zendesk/webhook/followup")

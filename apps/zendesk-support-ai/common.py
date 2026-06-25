@@ -706,6 +706,43 @@ def knowledge_find_requested_run(ticket_id: int) -> Optional[Dict[str, Any]]:
     return runs[0] if runs else None
 
 
+def knowledge_get_run(run_id: str) -> Dict[str, Any]:
+    """Knowledge API の run 詳細を取得する。"""
+    if not KNOWLEDGE_API_URL:
+        raise RuntimeError("SUPPORT_AI_KNOWLEDGE_API_URL が未設定です")
+    resp = requests.get(
+        KNOWLEDGE_API_URL + f"/api/runs/{run_id}",
+        headers={"Accept": "application/json"},
+        timeout=HTTP_TIMEOUT,
+    )
+    if not resp.ok:
+        raise RuntimeError(f"Knowledge API GET /api/runs/{run_id} -> {resp.status_code}: {resp.text[:500]}")
+    data = resp.json()
+    run = data.get("run") if isinstance(data, dict) else None
+    if not isinstance(run, dict):
+        raise RuntimeError(f"Knowledge API GET /api/runs/{run_id} returned no run")
+    return run
+
+
+def knowledge_update_run(run_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Knowledge API の run を更新する。"""
+    if not KNOWLEDGE_API_URL:
+        raise RuntimeError("SUPPORT_AI_KNOWLEDGE_API_URL が未設定です")
+    resp = requests.patch(
+        KNOWLEDGE_API_URL + f"/api/runs/{run_id}",
+        json=payload,
+        headers={"Content-Type": "application/json", "Accept": "application/json"},
+        timeout=HTTP_TIMEOUT,
+    )
+    if not resp.ok:
+        raise RuntimeError(f"Knowledge API PATCH /api/runs/{run_id} -> {resp.status_code}: {resp.text[:500]}")
+    data = resp.json()
+    run = data.get("run") if isinstance(data, dict) else None
+    if not isinstance(run, dict):
+        raise RuntimeError(f"Knowledge API PATCH /api/runs/{run_id} returned no run")
+    return run
+
+
 def knowledge_attach_run_document(run_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     """既存runへ document を添付する。"""
     if not KNOWLEDGE_API_URL:
@@ -719,3 +756,20 @@ def knowledge_attach_run_document(run_id: str, payload: Dict[str, Any]) -> Dict[
     if not resp.ok:
         raise RuntimeError(f"Knowledge API POST /api/runs/{run_id}/documents -> {resp.status_code}: {resp.text[:500]}")
     return resp.json()
+
+
+def knowledge_list_run_documents(run_id: str, *, include_body: bool = False) -> List[Dict[str, Any]]:
+    """Knowledge API の run 添付 document 一覧を取得する。"""
+    if not KNOWLEDGE_API_URL:
+        raise RuntimeError("SUPPORT_AI_KNOWLEDGE_API_URL が未設定です")
+    resp = requests.get(
+        KNOWLEDGE_API_URL + f"/api/runs/{run_id}/documents",
+        params={"include_body": "1" if include_body else "0"},
+        headers={"Accept": "application/json"},
+        timeout=HTTP_TIMEOUT,
+    )
+    if not resp.ok:
+        raise RuntimeError(f"Knowledge API GET /api/runs/{run_id}/documents -> {resp.status_code}: {resp.text[:500]}")
+    data = resp.json()
+    documents = data.get("documents") if isinstance(data, dict) else []
+    return documents if isinstance(documents, list) else []

@@ -17,6 +17,7 @@ import time
 import common
 import llm_client
 import pii_mask
+import target_normalizer
 
 
 SUPPORT_AI_TRIAGE_TAG = os.environ.get("SUPPORT_AI_TRIAGE_TAG", "ai_triaged")
@@ -60,6 +61,8 @@ def _build_runbook(triage: dict) -> str:
         "- Zendesk ticket_id は run metadata を参照する。\n"
         "- environment / machine が未設定の場合は、本文、タグ、運用文脈から推定し、"
         "不明なら findings に `environment_unknown` と明記する。\n"
+        f"- target_resolution: {triage.get('target_resolution', '')}\n"
+        f"- target_resolution_reason: {triage.get('target_resolution_reason', '')}\n"
         "- 公開返信は行わない。回答案は `answer_draft` として Knowledge に登録する。\n\n"
         "## Safety Gate\n"
         "1. 破壊的操作、設定変更、ジョブ投入、ユーザーデータ参照、管理者権限が必要な操作は、"
@@ -165,13 +168,46 @@ def _runbook_with_decision_delta(triage: dict, decision: dict) -> str:
     )
 
 
-def _create_knowledge_run(ticket_id: int, triage: dict) -> tuple[str | None, str | None, str, str]:
+def _resolved_target(event: dict, triage: dict) -> tuple[str, str, str, str]:
+    environment = str(event.get("environment") or "").strip()
+    raw_machine = str(event.get("machine") or "").strip()
+    machine, machine_status = target_normalizer.canonicalize_machine(raw_machine)
+    if raw_machine and machine_status in {"unknown", "ambiguous"}:
+        return environment, "", "operator_select", (
+            f"Zendesk webhook payload の machine={raw_machine!r} を一意なcanonical machineへ正規化できないため。"
+        )
+    if environment or machine:
+        return environment, machine, "identified_from_webhook", (
+            f"Zendesk webhook payload に対象情報が含まれていたため。machine_status={machine_status}"
+        )
+    if not environment and triage.get("environment_confidence") == "high":
+        environment = str(triage.get("environment") or "").strip()
+    if not machine and triage.get("machine_confidence") == "high":
+        raw_triage_machine = str(triage.get("machine") or "").strip()
+        machine, machine_status = target_normalizer.canonicalize_machine(raw_triage_machine)
+        if raw_triage_machine and not machine:
+            triage["machine_confidence"] = "low"
+    if environment or machine:
+        return environment, machine, "identified_from_text", (
+            f"triage AI が本文から高確信で対象候補を特定したため。machine_status={machine_status}"
+        )
+    return (
+        environment,
+        machine,
+        str(triage.get("target_resolution") or "ask_user"),
+        str(triage.get("target_resolution_reason") or ""),
+    )
+
+
+def _create_knowledge_run(ticket_id: int, triage: dict, *, environment: str = "", machine: str = "") -> tuple[str | None, str | None, str, str]:
     if not CREATE_KNOWLEDGE_RUNS or not common.knowledge_enabled():
         return None, None, "no_runbook_needed", "none"
     if not (triage.get("requires_runbook") or triage.get("requires_environment_knowledge")):
         return None, None, "no_runbook_needed", "none"
     payload = {
         "ticket_id": ticket_id,
+        "environment": environment,
+        "machine": machine,
         "status": "requested",
         "runbook": _build_runbook(triage),
         "summary": triage.get("summary", ""),
@@ -249,6 +285,10 @@ def _build_note_body(triage: dict, model: str, *, knowledge_run_id: str | None =
         f"- requires_runbook: {_yesno(triage.get('requires_runbook'))}\n"
         f"- requires_operator_check: {_yesno(triage.get('requires_operator_check'))}\n"
         f"- suggested_next_action: {triage.get('suggested_next_action', '').strip()}\n"
+        f"- target_resolution: {triage.get('target_resolution', '')}\n"
+        f"- target_resolution_reason: {triage.get('target_resolution_reason', '')}\n"
+        f"- environment: {triage.get('environment', '')} ({triage.get('environment_confidence', '')})\n"
+        f"- machine: {triage.get('machine', '')} ({triage.get('machine_confidence', '')})\n"
         f"{run_line}\n"
         f"■ 要約\n{triage.get('summary', '').strip()}\n\n"
         f"■ 推定原因\n{triage.get('probable_cause', '').strip()}\n\n"
@@ -284,7 +324,17 @@ def process_one(path, verbose: bool = False) -> bool:
 
         triage = llm_client.triage(masked_subject, masked_body)
         model = triage.get("_model", "unknown")
-        knowledge_run_id, knowledge_run_error, investigation_decision, runbook_change = _create_knowledge_run(ticket_id, triage)
+        environment, machine, target_resolution, target_resolution_reason = _resolved_target(event, triage)
+        triage["environment"] = environment
+        triage["machine"] = machine
+        triage["target_resolution"] = target_resolution
+        triage["target_resolution_reason"] = target_resolution_reason
+        knowledge_run_id, knowledge_run_error, investigation_decision, runbook_change = _create_knowledge_run(
+            ticket_id,
+            triage,
+            environment=environment,
+            machine=machine,
+        )
         if knowledge_run_error and verbose:
             common.log(f"knowledge run create failed ticket_{ticket_id}: {knowledge_run_error}")
 
@@ -301,6 +351,12 @@ def process_one(path, verbose: bool = False) -> bool:
             "requires_operator_check": triage["requires_operator_check"],
             "safe_to_reply_to_user": triage["safe_to_reply_to_user"],
             "suggested_next_action": triage["suggested_next_action"],
+            "environment": environment,
+            "machine": machine,
+            "environment_confidence": triage.get("environment_confidence"),
+            "machine_confidence": triage.get("machine_confidence"),
+            "target_resolution": target_resolution,
+            "target_resolution_reason": target_resolution_reason,
             "knowledge_run_id": knowledge_run_id,
             "investigation_decision": investigation_decision,
             "runbook_change": runbook_change,
