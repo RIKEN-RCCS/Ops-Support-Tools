@@ -42,6 +42,8 @@ Zendesk の新規チケット一次トリアージ、追加質問への返信ド
 | `SUPPORT_AI_QUEUE_DB` | support AI worker のSQLite queue DB。既定は `$SUPPORT_AI_QUEUE_DIR/queue.sqlite` |
 | `SUPPORT_AI_TRIAGE_TAG` | 投稿済み判定に使う Zendesk tag |
 | `SUPPORT_AI_TRIAGE_SEARCH_QUERY` | polling 用 Zendesk Search query |
+| `SUPPORT_AI_KNOWLEDGE_API_URL` | Knowledge API の内部URL。設定時、環境確認が必要なtriageをrunへ送る |
+| `SUPPORT_AI_CREATE_KNOWLEDGE_RUNS` | `requires_runbook` / `requires_environment_knowledge` のtriageでKnowledge runを作る |
 | `SUPPORT_AI_WEBHOOK_TOKEN` / `SUPPORT_AI_WEBHOOK_TOKEN_FILE` | webhook 共有トークン。未設定なら認証チェックなし |
 | `SUPPORT_AI_QUEUE_KEY` / `SUPPORT_AI_QUEUE_KEY_FILE` | スプール JSON 暗号化キー。Docker では secrets/support_ai_queue_key を使う |
 | `LLM_BASE_URL` / `LLM_API_KEY` / `LLM_API_KEY_FILE` | OpenAI 互換 LLM endpoint |
@@ -125,6 +127,25 @@ payload は次のいずれかの形なら受け付けます。
 Authorization: Bearer replace-me
 X-Support-AI-Webhook-Token: replace-me
 ```
+
+## Triage Gate and Runbook Handoff
+
+Triage AI は一次返信案だけでなく、公開返信へ進めてよいかを判定します。出力には次のゲート項目が含まれます。
+
+```text
+requires_environment_knowledge
+requires_runbook
+requires_operator_check
+safe_to_reply_to_user
+answer_confidence
+suggested_next_action
+```
+
+`safe_to_reply_to_user=false` の場合、社内メモでは一次返信ドラフトを「公開返信への利用は保留」として表示します。環境固有の module、CUDA、MPI、コンパイラ、ストレージ、ジョブ実行環境、サポート範囲などが必要な問い合わせでは、ユーザーへ一般論を返す前に担当者が Knowledge/runbook で確認します。
+
+`SUPPORT_AI_KNOWLEDGE_API_URL` が設定され、`SUPPORT_AI_CREATE_KNOWLEDGE_RUNS=1` の場合、`requires_runbook=true` または `requires_environment_knowledge=true` のtriageは Knowledge API に `status=requested` の run を作ります。run には初期runbookとして、既存知見確認、実機確認、リスク評価、findings / answer draft 登録の手順が入ります。同じ `ticket_id` に未完了の `requested` run が既にある場合は、runbook decision agent が「既存runへ文脈を attach するだけでよいか」「より深く/広く/作り直しの新規調査runが必要か」「runbook不要か」「担当者判断へ戻すか」を判定します。判定結果は `runbook-decision` document として Knowledge に残します。attach は同じrunbookの再実行を意味しません。
+
+Followup responder も同じゲートと decision agent を使います。公開会話履歴を LLM に渡すときは Zendesk user id / author_id を渡さず、`speaker=end_user` または `speaker=support` のみを使います。decision agent の `runbook_change` は `none`、`append_context`、`deepen`、`broaden`、`replace`、`initial` のいずれかです。
 
 ## Monitor
 

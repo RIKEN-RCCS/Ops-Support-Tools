@@ -20,6 +20,7 @@ import pii_mask
 
 
 SUPPORT_AI_TRIAGE_TAG = os.environ.get("SUPPORT_AI_TRIAGE_TAG", "ai_triaged")
+CREATE_KNOWLEDGE_RUNS = os.environ.get("SUPPORT_AI_CREATE_KNOWLEDGE_RUNS", "1").lower() in ("1", "true", "yes")
 
 
 def _extract_texts(ticket_id: int):
@@ -44,23 +45,219 @@ def _extract_texts(ticket_id: int):
     return subject, bodies, False
 
 
-def _build_note_body(triage: dict, model: str) -> str:
+def _yesno(value: object) -> str:
+    return "yes" if bool(value) else "no"
+
+
+def _build_runbook(triage: dict) -> str:
+    """環境依存の問い合わせを後続AI/人間へ渡すための初期runbook。"""
+    return (
+        "# Runbook Request\n\n"
+        "## Goal\n"
+        "チケット内容に対して、公開返信前に必要な環境固有情報・既存知見・実機状態を確認し、"
+        "根拠付きの回答案を作成する。\n\n"
+        "## Inputs\n"
+        "- Zendesk ticket_id は run metadata を参照する。\n"
+        "- environment / machine が未設定の場合は、本文、タグ、運用文脈から推定し、"
+        "不明なら findings に `environment_unknown` と明記する。\n"
+        "- 公開返信は行わない。回答案は `answer_draft` として Knowledge に登録する。\n\n"
+        "## Safety Gate\n"
+        "1. 破壊的操作、設定変更、ジョブ投入、ユーザーデータ参照、管理者権限が必要な操作は、"
+        "実行前に `requires_operator_approval` として停止する。\n"
+        "2. 実機確認は読み取り系コマンドを優先し、取得した事実と推測を分けて記録する。\n"
+        "3. 環境の提供方針やサポート範囲が不明な場合、一般論で断定せず担当者確認へ戻す。\n\n"
+        "## Execution Steps\n"
+        "1. Knowledge API で同じ category、environment、machine、関連タグの既存 documents / runs / handoffs を確認する。\n"
+        "2. チケット本文から、ユーザーが本当に聞いている判断点を1文で整理する。\n"
+        "3. 必要な環境情報を確認する。例: module、コンパイラ、CUDA、MPI、ライブラリ、ジョブ環境、"
+        "既知制約、運用方針、サポート範囲。\n"
+        "4. 確認結果から、推奨方針、代替案、追加質問の要否を判断する。\n"
+        "5. 解決できる場合は、根拠付きの回答案を作る。解決できない場合は、追加調査runbookまたは担当者確認事項を作る。\n\n"
+        "## Required Outputs\n"
+        "Knowledge のこの run に、少なくとも次の document を登録する。\n"
+        "- `findings`: 確認した事実、参照した知見、環境情報、未確認事項。\n"
+        "- `issue_on_run`: 実行中に起きた問題、権限不足、確認不能だった点。問題がなければ `none`。\n"
+        "- `summary`: 結論、根拠、残リスク、次アクション。\n"
+        "- `answer_draft`: Zendeskへ戻す社内メモ案または公開返信案。公開可否を明記する。\n\n"
+        "## Failed-Run Loop\n"
+        "この run で解決できない場合は、`summary` に不足情報と次に必要な確認を明記し、"
+        "追加runbook生成または `operator-review` handoff に回す。\n\n"
+        "## Initial AI Triage\n"
+        f"- summary: {triage.get('summary', '').strip()}\n"
+        f"- probable_cause: {triage.get('probable_cause', '').strip()}\n"
+        f"- category: {triage.get('category')}\n"
+        "- urgency: not_assessed\n"
+        f"- difficulty: {triage.get('difficulty')}\n"
+        f"- answer_confidence: {triage.get('answer_confidence')}\n"
+        f"- suggested_next_action: {triage.get('suggested_next_action', '').strip()}\n"
+    )
+
+
+def _decision_document_body(
+    *,
+    decision: str,
+    runbook_change: str,
+    triage: dict,
+    reason: str = "",
+    runbook_delta: str = "",
+    answer_draft_policy: str = "",
+) -> str:
+    return (
+        "# Runbook Decision\n\n"
+        f"- investigation_decision: {decision}\n"
+        f"- runbook_change: {runbook_change}\n"
+        f"- answer_draft_policy: {answer_draft_policy or ('draft' if triage.get('safe_to_reply_to_user') else 'hold')}\n\n"
+        "## Reason\n"
+        f"{reason or '同じ Zendesk ticket の未完了 run に対する runbook decision。'}\n\n"
+        "## Runbook Delta\n"
+        f"{runbook_delta or 'none'}\n\n"
+        "## Added Context\n"
+        f"- summary: {triage.get('summary', '').strip()}\n"
+        f"- probable_cause: {triage.get('probable_cause', '').strip()}\n"
+        f"- category: {triage.get('category')}\n"
+        f"- difficulty: {triage.get('difficulty')}\n"
+        f"- answer_confidence: {triage.get('answer_confidence')}\n"
+        f"- suggested_next_action: {triage.get('suggested_next_action', '').strip()}\n"
+    )
+
+
+def _attach_decision_document(
+    ticket_id: int,
+    run_id: str,
+    triage: dict,
+    *,
+    decision: dict,
+) -> None:
+    investigation_decision = str(decision.get("investigation_decision") or "attach_to_existing_run")
+    runbook_change = str(decision.get("runbook_change") or "append_context")
+    common.knowledge_attach_run_document(run_id, {
+        "role": "runbook_decision",
+        "ticket_id": ticket_id,
+        "kind": "runbook-decision",
+        "title": f"Runbook decision for ticket {ticket_id}",
+        "summary": f"{investigation_decision}; runbook_change={runbook_change}.",
+        "body_md": _decision_document_body(
+            decision=investigation_decision,
+            runbook_change=runbook_change,
+            triage=triage,
+            reason=str(decision.get("reason") or ""),
+            runbook_delta=str(decision.get("runbook_delta") or ""),
+            answer_draft_policy=str(decision.get("answer_draft_policy") or ""),
+        ),
+        "tags": ["runbook-decision", "triage", str(triage.get("category") or "other")],
+        "source": "zendesk-support-ai",
+    })
+
+
+def _runbook_with_decision_delta(triage: dict, decision: dict) -> str:
+    runbook = _build_runbook(triage)
+    delta = str(decision.get("runbook_delta") or "").strip()
+    reason = str(decision.get("reason") or "").strip()
+    if not delta and not reason:
+        return runbook
+    return (
+        f"{runbook}\n\n"
+        "## Runbook Decision Delta\n"
+        f"- investigation_decision: {decision.get('investigation_decision')}\n"
+        f"- runbook_change: {decision.get('runbook_change')}\n"
+        f"- reason: {reason or 'none'}\n"
+        f"- runbook_delta: {delta or 'none'}\n"
+    )
+
+
+def _create_knowledge_run(ticket_id: int, triage: dict) -> tuple[str | None, str | None, str, str]:
+    if not CREATE_KNOWLEDGE_RUNS or not common.knowledge_enabled():
+        return None, None, "no_runbook_needed", "none"
+    if not (triage.get("requires_runbook") or triage.get("requires_environment_knowledge")):
+        return None, None, "no_runbook_needed", "none"
+    payload = {
+        "ticket_id": ticket_id,
+        "status": "requested",
+        "runbook": _build_runbook(triage),
+        "summary": triage.get("summary", ""),
+    }
+    try:
+        created_runbook_change = "initial"
+        existing = common.knowledge_find_requested_run(ticket_id)
+        if existing and existing.get("id"):
+            decision = llm_client.runbook_decision(
+                source="triage",
+                ticket_id=ticket_id,
+                analysis=triage,
+                existing_run=existing,
+            )
+            decision = llm_client.normalize_runbook_decision(decision)
+            investigation_decision = str(decision.get("investigation_decision") or "operator_review")
+            runbook_change = str(decision.get("runbook_change") or "none")
+            run_id = str(existing["id"])
+            if investigation_decision == "attach_to_existing_run":
+                _attach_decision_document(ticket_id, run_id, triage, decision=decision)
+                return run_id, None, investigation_decision, runbook_change
+            if investigation_decision == "no_runbook_needed":
+                _attach_decision_document(ticket_id, run_id, triage, decision=decision)
+                return None, None, investigation_decision, runbook_change
+            if investigation_decision == "operator_review":
+                _attach_decision_document(ticket_id, run_id, triage, decision=decision)
+                return run_id, None, investigation_decision, runbook_change
+            payload["runbook"] = _runbook_with_decision_delta(triage, decision)
+            payload["summary"] = f"{triage.get('summary', '')} ({runbook_change})"
+            created_runbook_change = runbook_change
+        created = common.knowledge_create_run(payload)
+        run = created.get("run") if isinstance(created, dict) else {}
+        run_id = run.get("id") if isinstance(run, dict) else None
+        return str(run_id) if run_id else None, None, "open_new_investigation", created_runbook_change
+    except Exception as exc:  # noqa: BLE001
+        return None, str(exc), "operator_review", "none"
+
+
+def _build_note_body(triage: dict, model: str, *, knowledge_run_id: str | None = None,
+                     knowledge_run_error: str | None = None, investigation_decision: str = "",
+                     runbook_change: str = "") -> str:
     """トリアージ結果から社内メモ本文を組み立てる(プレースホルダは残したまま)。"""
     qs = triage.get("clarifying_questions") or []
     q_lines = "\n".join(f"- {q}" for q in qs) if qs else "- (なし)"
+    safe_to_reply = bool(triage.get("safe_to_reply_to_user"))
+    if safe_to_reply:
+        draft_label = "■ 一次返信ドラフト"
+        draft_body = triage.get("draft_reply", "").strip()
+    else:
+        draft_label = "■ 一次返信ドラフト(公開返信への利用は保留)"
+        draft_body = (
+            "この問い合わせは環境固有情報、既存知見、または実機確認が必要な可能性があります。\n"
+            "以下の文案をそのまま公開返信に使わず、Knowledge/runbook確認後に回答案を作成してください。\n\n"
+            + triage.get("draft_reply", "").strip()
+        )
+    run_line = ""
+    if knowledge_run_id:
+        run_line = (
+            "\n■ Knowledge run\n"
+            f"investigation_decision: {investigation_decision or 'open_new_investigation'}\n"
+            f"runbook_change: {runbook_change or 'initial'}\n"
+            f"run_id: {knowledge_run_id}\n"
+        )
+    elif knowledge_run_error:
+        run_line = "\n■ Knowledge run\n作成失敗: 後続で手動作成してください。\n"
     return (
         f"🤖 AI 一次トリアージ(自動生成・参考情報 / model: {model})\n"
         "─────────────────────────────\n"
-        f"■ 緊急度: {triage.get('severity')}　／　カテゴリ: {triage.get('category')}"
+        f"■ 緊急度: 判断対象外　／　カテゴリ: {triage.get('category')}"
         f"　／　難易度: {triage.get('difficulty')}\n\n"
+        "■ 回答ゲート\n"
+        f"- answer_confidence: {triage.get('answer_confidence')}\n"
+        f"- safe_to_reply_to_user: {_yesno(triage.get('safe_to_reply_to_user'))}\n"
+        f"- requires_environment_knowledge: {_yesno(triage.get('requires_environment_knowledge'))}\n"
+        f"- requires_runbook: {_yesno(triage.get('requires_runbook'))}\n"
+        f"- requires_operator_check: {_yesno(triage.get('requires_operator_check'))}\n"
+        f"- suggested_next_action: {triage.get('suggested_next_action', '').strip()}\n"
+        f"{run_line}\n"
         f"■ 要約\n{triage.get('summary', '').strip()}\n\n"
         f"■ 推定原因\n{triage.get('probable_cause', '').strip()}\n\n"
         f"■ ユーザーへの追加確認事項\n{q_lines}\n\n"
-        f"■ 一次返信ドラフト\n{triage.get('draft_reply', '').strip()}\n"
+        f"{draft_label}\n{draft_body}\n"
         "─────────────────────────────\n"
         "※ 担当はシステムが決定し、投稿時にこのメモ末尾へ追記されます。\n"
         f"※ このメモは {model} により自動生成されました。"
-        "severity / 難易度は参考情報です。アサイン・優先度・返信は人間が判断してください。"
+        "緊急度・優先度は判断対象外です。難易度は参考情報です。アサイン・返信は人間が判断してください。"
     )
 
 
@@ -87,15 +284,34 @@ def process_one(path, verbose: bool = False) -> bool:
 
         triage = llm_client.triage(masked_subject, masked_body)
         model = triage.get("_model", "unknown")
+        knowledge_run_id, knowledge_run_error, investigation_decision, runbook_change = _create_knowledge_run(ticket_id, triage)
+        if knowledge_run_error and verbose:
+            common.log(f"knowledge run create failed ticket_{ticket_id}: {knowledge_run_error}")
 
         record = {
             "ticket_id": ticket_id,
             "generated_at": int(time.time()),
             "model": model,
-            "severity": triage["severity"],
+            "severity": "not_assessed",
             "category": triage["category"],
             "difficulty": triage["difficulty"],  # poster の割り当てロジックで使う
-            "note_body": _build_note_body(triage, model),
+            "answer_confidence": triage["answer_confidence"],
+            "requires_environment_knowledge": triage["requires_environment_knowledge"],
+            "requires_runbook": triage["requires_runbook"],
+            "requires_operator_check": triage["requires_operator_check"],
+            "safe_to_reply_to_user": triage["safe_to_reply_to_user"],
+            "suggested_next_action": triage["suggested_next_action"],
+            "knowledge_run_id": knowledge_run_id,
+            "investigation_decision": investigation_decision,
+            "runbook_change": runbook_change,
+            "note_body": _build_note_body(
+                triage,
+                model,
+                knowledge_run_id=knowledge_run_id,
+                knowledge_run_error=knowledge_run_error,
+                investigation_decision=investigation_decision,
+                runbook_change=runbook_change,
+            ),
             "mask_mapping": mapping,  # ローカル保持のみ。LLM にも外部にも送らない
         }
         common.atomic_write_json(common.spool_path("pending") / f"ticket_{ticket_id}.json", record)
@@ -103,7 +319,7 @@ def process_one(path, verbose: bool = False) -> bool:
         path.unlink()
         if verbose:
             common.log(f"-> pending/ticket_{ticket_id}.json "
-                       f"({record['severity']}/{record['category']} via {model})")
+                       f"(urgency:not_assessed/{record['category']} via {model})")
         return True
     except Exception as e:
         common.log(f"generate failed ticket_{ticket_id}: {e}")

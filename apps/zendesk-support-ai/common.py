@@ -60,6 +60,7 @@ AGENTS_TEMPLATE_FILE = Path(os.environ.get(
     str(Path(__file__).resolve().parent / "agents.example.json"),
 ))
 ASSIGNEE_FIELD_ID_ENV = os.environ.get("SUPPORT_AI_ASSIGNEE_FIELD_ID", "").strip()
+KNOWLEDGE_API_URL = os.environ.get("SUPPORT_AI_KNOWLEDGE_API_URL", "").rstrip("/")
 
 
 def log(*args: Any) -> None:
@@ -169,6 +170,23 @@ def write_queue_item(queue: str, name: str, data: Dict[str, Any]) -> QueueItem:
             (queue, name, _encode_queue_payload(data), now, now),
         )
     return QueueItem(queue=queue, name=name)
+
+
+def update_queue_item(item: QueueItem, data: Dict[str, Any]) -> QueueItem:
+    _init_queue_db()
+    now = int(time.time())
+    with _queue_conn() as conn:
+        cur = conn.execute(
+            """
+            UPDATE queue_items
+            SET payload_json = ?, updated_at = ?
+            WHERE queue = ? AND name = ?
+            """,
+            (_encode_queue_payload(data), now, item.queue, item.name),
+        )
+    if cur.rowcount == 0:
+        raise FileNotFoundError(f"queue item not found: {item.queue}/{item.name}")
+    return item
 
 
 def read_queue_item(item: QueueItem) -> Dict[str, Any]:
@@ -632,3 +650,72 @@ def post_internal_note(ticket_id: int, body: str, tags: Optional[List[str]] = No
         json_body={"ticket": ticket_update},
     )
     return result
+
+
+# --------------------------------------------------------------------------
+# Knowledge API client
+# --------------------------------------------------------------------------
+
+def knowledge_enabled() -> bool:
+    return bool(KNOWLEDGE_API_URL)
+
+
+def knowledge_create_run(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Knowledge API に run request を作成する。
+
+    Knowledge API URL は内部ネットワーク向けの非秘密設定。失敗時の扱いは呼び出し側で決める。
+    """
+    if not KNOWLEDGE_API_URL:
+        raise RuntimeError("SUPPORT_AI_KNOWLEDGE_API_URL が未設定です")
+    resp = requests.post(
+        KNOWLEDGE_API_URL + "/api/runs",
+        json=payload,
+        headers={"Content-Type": "application/json", "Accept": "application/json"},
+        timeout=HTTP_TIMEOUT,
+    )
+    if not resp.ok:
+        raise RuntimeError(f"Knowledge API POST /api/runs -> {resp.status_code}: {resp.text[:500]}")
+    return resp.json()
+
+
+def knowledge_list_runs(*, ticket_id: Optional[int] = None, status: str = "", limit: int = 50) -> List[Dict[str, Any]]:
+    """Knowledge API の run 一覧を取得する。"""
+    if not KNOWLEDGE_API_URL:
+        raise RuntimeError("SUPPORT_AI_KNOWLEDGE_API_URL が未設定です")
+    params: Dict[str, Any] = {"limit": int(limit)}
+    if ticket_id is not None:
+        params["ticket_id"] = int(ticket_id)
+    if status:
+        params["status"] = status
+    resp = requests.get(
+        KNOWLEDGE_API_URL + "/api/runs",
+        params=params,
+        headers={"Accept": "application/json"},
+        timeout=HTTP_TIMEOUT,
+    )
+    if not resp.ok:
+        raise RuntimeError(f"Knowledge API GET /api/runs -> {resp.status_code}: {resp.text[:500]}")
+    data = resp.json()
+    runs = data.get("runs") if isinstance(data, dict) else []
+    return runs if isinstance(runs, list) else []
+
+
+def knowledge_find_requested_run(ticket_id: int) -> Optional[Dict[str, Any]]:
+    """同じ Zendesk ticket の未完了 requested run を1件返す。"""
+    runs = knowledge_list_runs(ticket_id=ticket_id, status="requested", limit=20)
+    return runs[0] if runs else None
+
+
+def knowledge_attach_run_document(run_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    """既存runへ document を添付する。"""
+    if not KNOWLEDGE_API_URL:
+        raise RuntimeError("SUPPORT_AI_KNOWLEDGE_API_URL が未設定です")
+    resp = requests.post(
+        KNOWLEDGE_API_URL + f"/api/runs/{run_id}/documents",
+        json=payload,
+        headers={"Content-Type": "application/json", "Accept": "application/json"},
+        timeout=HTTP_TIMEOUT,
+    )
+    if not resp.ok:
+        raise RuntimeError(f"Knowledge API POST /api/runs/{run_id}/documents -> {resp.status_code}: {resp.text[:500]}")
+    return resp.json()

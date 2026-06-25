@@ -16,6 +16,7 @@ import time
 from typing import Any, Optional
 
 from flask import Flask, Response, jsonify, render_template_string, request, url_for
+from markupsafe import Markup, escape
 
 import common
 from secret_config import env_secret
@@ -36,7 +37,14 @@ th { background: #eef1f4; font-weight: 600; }
 a { color: #145dbf; }
 .meta { color: #66717d; font-size: 13px; }
 .panel { background: white; border: 1px solid #e2e6ea; padding: 14px; margin: 14px 0; }
-pre { background: #101820; color: #f4f7fb; overflow: auto; padding: 14px; white-space: pre-wrap; }
+pre { background: #101820; color: #f4f7fb; overflow: auto; padding: 14px; white-space: pre; line-height: 1.45; tab-size: 2; }
+.payload { background: white; border: 1px solid #e2e6ea; }
+.payload-row { display: grid; grid-template-columns: minmax(160px, 260px) 1fr; border-top: 1px solid #e2e6ea; }
+.payload-row:first-child { border-top: 0; }
+.payload-key { background: #eef1f4; font-weight: 600; padding: 9px 10px; overflow-wrap: anywhere; }
+.payload-value { padding: 9px 10px; overflow: auto; }
+.payload-list { margin: 0; padding-left: 20px; }
+.payload-text { background: #f7f8fa; color: #17202a; border: 1px solid #e2e6ea; margin: 0; white-space: pre-wrap; }
 """
 
 LAYOUT = """
@@ -61,7 +69,7 @@ LAYOUT = """
 
 
 def _render(title: str, body: str, **context: Any) -> str:
-    inner = render_template_string(body, **context)
+    inner = render_template_string(body, queues=MONITOR_QUEUES, **context)
     return render_template_string(LAYOUT, title=title, css=BASE_CSS, body=inner, queues=MONITOR_QUEUES)
 
 
@@ -125,6 +133,29 @@ def _queue_items(queue: str) -> list[dict[str, Any]]:
             }
         )
     return rows
+
+
+def _format_payload_html(value: Any) -> Markup:
+    if isinstance(value, dict):
+        rows = []
+        for key, item in value.items():
+            rows.append(
+                "<div class=\"payload-row\">"
+                f"<div class=\"payload-key\">{escape(str(key))}</div>"
+                f"<div class=\"payload-value\">{_format_payload_html(item)}</div>"
+                "</div>"
+            )
+        return Markup("<div class=\"payload\">" + "".join(rows) + "</div>")
+    if isinstance(value, list):
+        items = "".join(f"<li>{_format_payload_html(item)}</li>" for item in value)
+        return Markup(f"<ol class=\"payload-list\">{items}</ol>")
+    if isinstance(value, str):
+        if "\n" in value:
+            return Markup(f"<pre class=\"payload-text\">{escape(value)}</pre>")
+        return Markup(f"<span>{escape(value)}</span>")
+    if value is None:
+        return Markup("<span class=\"meta\">null</span>")
+    return Markup(f"<code>{escape(json.dumps(value, ensure_ascii=False))}</code>")
 
 
 def _find_ticket_id(payload: Any) -> Optional[int]:
@@ -287,6 +318,7 @@ def monitor_queue_item(queue: str, name: str):
     for item in _queue_items(queue):
         if item["name"] == name:
             payload = json.dumps(item["payload"], ensure_ascii=False, indent=2)
+            payload_html = _format_payload_html(item["payload"])
             return _render(
                 f"{queue}/{name}",
                 """
@@ -294,12 +326,16 @@ def monitor_queue_item(queue: str, name: str):
                 <div class="panel">
                   <div class="meta">ticket={{ item.ticket_id or "" }} comment={{ item.comment_id or "" }} source={{ item.source }}</div>
                 </div>
-                <pre>{{ payload }}</pre>
+                <h2>Readable Payload</h2>
+                {{ payload_html }}
+                <h2>Raw JSON</h2>
+                <pre><code>{{ payload }}</code></pre>
                 """,
                 queue=queue,
                 name=name,
                 item=item,
                 payload=payload,
+                payload_html=payload_html,
             )
     return _render("Queue item not found", "<h1>Queue item not found</h1>"), 404
 
