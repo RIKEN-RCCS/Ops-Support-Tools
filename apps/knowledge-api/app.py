@@ -17,6 +17,8 @@ from flask import Flask, jsonify, redirect, render_template_string, request, url
 import field_crypto
 
 DB_PATH = Path(os.environ.get("KNOWLEDGE_DB", "/data/db.sqlite"))
+WRITE_TOKEN_FILE = os.environ.get("KNOWLEDGE_API_WRITE_TOKEN_FILE", "")
+WRITE_TOKEN = os.environ.get("KNOWLEDGE_API_WRITE_TOKEN", "")
 
 app = Flask(__name__)
 
@@ -311,6 +313,30 @@ def _ensure_column(conn: sqlite3.Connection, table: str, column: str, ddl: str) 
 
 def _json_error(message: str, status: int):
     return jsonify({"ok": False, "error": message}), status
+
+
+def _write_token() -> str:
+    if WRITE_TOKEN_FILE:
+        return Path(WRITE_TOKEN_FILE).read_text(encoding="utf-8").strip()
+    return WRITE_TOKEN.strip()
+
+
+def _require_write_token() -> None:
+    expected = _write_token()
+    if not expected:
+        return
+    header = str(request.headers.get("Authorization") or "")
+    prefix = "Bearer "
+    if not header.startswith(prefix) or header[len(prefix):].strip() != expected:
+        raise PermissionError("valid bearer token is required")
+
+
+def _check_write_token() -> Any | None:
+    try:
+        _require_write_token()
+    except PermissionError as exc:
+        return _json_error(str(exc), 401)
+    return None
 
 
 def _decrypt_field(ciphertext: str, fallback: str = "") -> str:
@@ -2224,6 +2250,9 @@ def _lease_seconds(value: Any) -> int:
 @app.post("/api/runs/claim")
 def claim_run():
     _init_db()
+    auth_error = _check_write_token()
+    if auth_error:
+        return auth_error
     payload = request.get_json(silent=True) or {}
     claimant = str(payload.get("claimant") or payload.get("claimed_by") or "").strip()
     if not claimant:
@@ -2331,6 +2360,9 @@ def claim_run():
 @app.post("/api/runs/<run_id>/claim/heartbeat")
 def heartbeat_run_claim(run_id: str):
     _init_db()
+    auth_error = _check_write_token()
+    if auth_error:
+        return auth_error
     payload = request.get_json(silent=True) or {}
     token = str(payload.get("claim_token") or "").strip()
     if not token:
@@ -2358,6 +2390,9 @@ def heartbeat_run_claim(run_id: str):
 @app.post("/api/runs/<run_id>/claim/release")
 def release_run_claim(run_id: str):
     _init_db()
+    auth_error = _check_write_token()
+    if auth_error:
+        return auth_error
     payload = request.get_json(silent=True) or {}
     token = str(payload.get("claim_token") or "").strip()
     if not token:
@@ -2462,6 +2497,9 @@ def create_run_document(run_id: str):
 @app.post("/api/runs/<run_id>/execution-result")
 def create_run_execution_result(run_id: str):
     _init_db()
+    auth_error = _check_write_token()
+    if auth_error:
+        return auth_error
     payload = request.get_json(silent=True) or {}
     with _connect() as conn:
         run_row = conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
