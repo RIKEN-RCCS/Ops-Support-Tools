@@ -58,9 +58,12 @@ Production Docker uses:
 
 ```text
 apps/knowledge-api/secrets/knowledge_field_key
+apps/knowledge-api/secrets/knowledge_api_write_token
 ```
 
 Losing this key makes encrypted fields unrecoverable.
+
+`knowledge_api_write_token` protects the narrow runbook handoff write endpoints. Configure it through `KNOWLEDGE_API_WRITE_TOKEN_FILE`; clients send it as `Authorization: Bearer ...`. Do not expose this token in documents, Zendesk comments, logs, or screenshots.
 
 ## Web Browse
 
@@ -283,3 +286,18 @@ Execution result fields:
 | `answer_draft` | Draft text for Zendesk or an internal note; keep `answer_draft_policy=hold` unless it is ready for review |
 
 Recommended status after registration is `operator_review` when a human should review the findings or answer draft. Use `closed` only when the run is complete and no follow-up action remains. Creating a `zendesk-draft` handoff queues a draft for later review; it still does not post to Zendesk.
+
+## Narrow Gateway Surface
+
+Real-machine gateways only need these endpoints:
+
+```text
+POST /api/runs/claim
+GET  /api/runs/{run_id}
+GET  /api/runs/{run_id}/documents?include_body=1
+POST /api/runs/{run_id}/claim/heartbeat
+POST /api/runs/{run_id}/claim/release
+POST /api/runs/{run_id}/execution-result
+```
+
+Require the write token for the four POST endpoints. Keep the management web UI under `/knowledge/` and broad APIs such as `/api/search`, `/api/documents`, `/api/document-handoffs`, `/api/runs` list, and generic run document creation out of the real-machine gateway allowlist unless there is a separate operational reason.

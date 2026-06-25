@@ -1,0 +1,19 @@
+Bootstrap: docker
+From: python:3.12-slim
+
+%labels
+    Author Ops-Support-Tools
+    Description Runbook gateway CLI for Knowledge API handoff
+
+%files
+    runbook_gateway.py /opt/runbook-gateway/runbook_gateway.py
+
+%post
+    chmod 755 /opt/runbook-gateway/runbook_gateway.py
+    ln -s /opt/runbook-gateway/runbook_gateway.py /usr/local/bin/runbook-gateway
+
+%environment
+    export RUNBOOK_GATEWAY_TOKEN_FILE=/run/secrets/knowledge_write_token
+
+%runscript
+    exec /usr/local/bin/runbook-gateway "$@"
