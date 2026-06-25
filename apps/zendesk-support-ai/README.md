@@ -49,6 +49,8 @@ Zendesk の新規チケット一次トリアージ、追加質問への返信ド
 | `LLM_BASE_URL` / `LLM_API_KEY` / `LLM_API_KEY_FILE` | OpenAI 互換 LLM endpoint |
 | `SUPPORT_AI_MODEL` | 使用モデル |
 | `SUPPORT_AI_FALLBACK_MODELS` | フォールバックモデル。カンマ区切り |
+| `SUPPORT_AI_RUNBOOK_MODEL` | runbook生成・実行結果整理向けの強めのモデル。未設定なら `SUPPORT_AI_MODEL` を使う |
+| `SUPPORT_AI_RUNBOOK_FALLBACK_MODELS` | runbook向けフォールバックモデル。カンマ区切り |
 | `SUPPORT_AI_CONTEXT` | LLM に渡すサポート対象の説明 |
 | `ZENDESK_URL` / `ZENDESK_EMAIL` / `ZENDESK_KEY` / `ZENDESK_KEY_FILE` | Zendesk API token 認証 |
 | `SUPPORT_AI_AGENTS_FILE` | 担当者名簿 JSON |
@@ -146,6 +148,23 @@ suggested_next_action
 `SUPPORT_AI_KNOWLEDGE_API_URL` が設定され、`SUPPORT_AI_CREATE_KNOWLEDGE_RUNS=1` の場合、`requires_runbook=true` または `requires_environment_knowledge=true` のtriageは Knowledge API に `status=requested` の run を作ります。run には初期runbookとして、既存知見確認、実機確認、リスク評価、findings / answer draft 登録の手順が入ります。同じ `ticket_id` に未完了の `requested` run が既にある場合は、runbook decision agent が「既存runへ文脈を attach するだけでよいか」「より深く/広く/作り直しの新規調査runが必要か」「runbook不要か」「担当者判断へ戻すか」を判定します。判定結果は `runbook-decision` document として Knowledge に残します。attach は同じrunbookの再実行を意味しません。
 
 Followup responder も同じゲートと decision agent を使います。公開会話履歴を LLM に渡すときは Zendesk user id / author_id を渡さず、`speaker=end_user` または `speaker=support` のみを使います。decision agent の `runbook_change` は `none`、`append_context`、`deepen`、`broaden`、`replace`、`initial` のいずれかです。
+
+## Runbook LLM Evaluation
+
+Triage/followup の短い判定と、runbook生成・実行結果整理は別の能力です。runbook側は長い文脈、環境固有確認、安全な実機手順、findings / issue_on_run / summary / answer_draft への変換が必要なため、`SUPPORT_AI_RUNBOOK_MODEL` で強めのモデルを別指定できます。
+
+代表ケースで runbook 向けモデルを評価するには、コンテナ内で次を実行します。API key は Docker secrets から読み、値は表示しません。
+
+```bash
+docker compose exec -T generator python eval_runbook_llm.py
+docker compose exec -T generator python eval_runbook_llm.py --models model-a,model-b
+docker compose exec -T generator python eval_runbook_llm.py --case cuda_gcc_hpcx --json
+docker compose exec -T generator python eval_runbook_llm.py --relaxed-json --models Kimi-K2-Thinking,K2-Think
+```
+
+評価は、構造化出力、環境固有観点、読み取り優先・承認・停止条件、Knowledgeへの受け渡しテンプレートを簡易採点します。スコアは自動採点の目安なので、採用前には `--json` の出力を人間が読み、危険な手順や根拠のない断定がないか確認してください。
+
+現時点の strict JSON schema 経路での推奨は `SUPPORT_AI_RUNBOOK_MODEL=Qwen/Qwen3.6-35B-A3B-FP8`、fallback は `Qwen/Qwen3.6-27B-FP8,zai-org/GLM-4.7-FP8` です。Kimi 系のように strict JSON schema と相性が悪いモデルは、`--relaxed-json` で thinking を有効にし、自由形式出力から JSON object を後処理抽出して評価します。
 
 ## Monitor
 

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from typing import Any, Dict, Optional
 
 import requests
@@ -26,6 +27,10 @@ DEFAULT_MODEL = os.environ.get("SUPPORT_AI_MODEL", "")
 # 本命が落ちた場合のフォールバック(カンマ区切り)。空なら無効。
 FALLBACK_MODELS = [m.strip() for m in os.environ.get(
     "SUPPORT_AI_FALLBACK_MODELS", ""
+).split(",") if m.strip()]
+RUNBOOK_MODEL = os.environ.get("SUPPORT_AI_RUNBOOK_MODEL", "").strip()
+RUNBOOK_FALLBACK_MODELS = [m.strip() for m in os.environ.get(
+    "SUPPORT_AI_RUNBOOK_FALLBACK_MODELS", ""
 ).split(",") if m.strip()]
 LLM_TIMEOUT = float(os.environ.get("SUPPORT_AI_LLM_TIMEOUT", "180"))
 LLM_HEALTHCHECK_PATH = os.environ.get("SUPPORT_AI_LLM_HEALTHCHECK_PATH", "/models")
@@ -200,6 +205,15 @@ def _model_candidates(model: Optional[str]) -> list[str]:
     return candidates
 
 
+def runbook_model_candidates(model: Optional[str] = None) -> list[str]:
+    """Runbook生成/評価向けのモデル候補。未設定なら通常モデルへフォールバックする。"""
+    if model:
+        return _model_candidates(model)
+    candidates = [RUNBOOK_MODEL] + RUNBOOK_FALLBACK_MODELS
+    candidates = [m for m in candidates if m]
+    return candidates or _model_candidates(None)
+
+
 def healthcheck() -> Dict[str, Any]:
     """OpenAI 互換 LLM endpoint の疎通確認。"""
     if not DEFAULT_MODEL:
@@ -271,6 +285,110 @@ def chat_json(
         raise RuntimeError("LLM returned empty content")
     # 日本語は \\uXXXX で来るが json.loads で復元される
     return json.loads(content)
+
+
+def _extract_json_object(text: str) -> Dict[str, Any]:
+    """自由形式のLLM応答から最初の JSON object を抽出する。評価用途向け。"""
+    stripped = text.strip()
+    fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", stripped, flags=re.DOTALL | re.IGNORECASE)
+    candidates = [fenced.group(1)] if fenced else []
+    if stripped.startswith("{") and stripped.endswith("}"):
+        candidates.append(stripped)
+    start = stripped.find("{")
+    end = stripped.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        candidates.append(stripped[start:end + 1])
+    last_err: Exception | None = None
+    for candidate in candidates:
+        try:
+            loaded = json.loads(candidate)
+            if isinstance(loaded, dict):
+                return loaded
+        except Exception as exc:  # noqa: BLE001
+            last_err = exc
+    raise RuntimeError(f"LLM response did not contain a parseable JSON object: {last_err}")
+
+
+def _coerce_json_schema_defaults(data: Dict[str, Any], schema: Dict[str, Any]) -> Dict[str, Any]:
+    """評価用に schema の required/properties に合わせて不足値を安全側で補う。"""
+    properties = schema.get("properties") if isinstance(schema, dict) else {}
+    required = schema.get("required") if isinstance(schema, dict) else []
+    if not isinstance(properties, dict) or not isinstance(required, list):
+        return data
+    coerced = dict(data)
+    for key in required:
+        if key in coerced:
+            continue
+        prop = properties.get(key, {}) if isinstance(properties.get(key), dict) else {}
+        prop_type = prop.get("type")
+        if prop_type == "array":
+            coerced[key] = []
+        elif prop.get("enum"):
+            coerced[key] = prop["enum"][0]
+        elif prop_type == "boolean":
+            coerced[key] = False
+        elif prop_type in {"integer", "number"}:
+            coerced[key] = 0
+        else:
+            coerced[key] = ""
+    return coerced
+
+
+def chat_json_relaxed(
+    system: str,
+    user: str,
+    schema: Dict[str, Any],
+    *,
+    model: Optional[str] = None,
+    temperature: float = 0.0,
+    max_tokens: int = 4096,
+    enable_thinking: bool = True,
+) -> Dict[str, Any]:
+    """thinking有効・JSON後処理ありの評価用 chat 呼び出し。
+
+    本番のtriage/followup経路では使わない。strict response_format と相性が悪い
+    モデルの runbook 評価用に、JSON object の抽出と不足キー補完だけを行う。
+    """
+    model = model or DEFAULT_MODEL
+    if not model:
+        raise RuntimeError("SUPPORT_AI_MODEL が未設定です")
+    payload: Dict[str, Any] = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "chat_template_kwargs": {"enable_thinking": enable_thinking},
+    }
+    resp = requests.post(
+        LLM_BASE_URL + "/chat/completions",
+        headers={
+            "Authorization": "Bearer " + _api_key(),
+            "Content-Type": "application/json",
+        },
+        json=payload,
+        timeout=LLM_TIMEOUT,
+    )
+    if not resp.ok:
+        raise RuntimeError(f"LLM {model} -> {resp.status_code}: {resp.text[:500]}")
+    data = resp.json()
+    choice = data["choices"][0]
+    finish = choice.get("finish_reason")
+    message = choice.get("message") or {}
+    content = message.get("content") or ""
+    if not content:
+        content = message.get("reasoning_content") or ""
+    if not content:
+        raise RuntimeError("LLM returned empty content")
+    try:
+        parsed = _extract_json_object(content)
+    except Exception:
+        if finish not in {"stop", None}:
+            raise RuntimeError(f"LLM finish_reason={finish!r} (incomplete output)")
+        raise
+    return _coerce_json_schema_defaults(parsed, schema)
 
 
 def triage(masked_subject: str, masked_body: str, *, model: Optional[str] = None) -> Dict[str, Any]:
