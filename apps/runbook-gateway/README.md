@@ -31,6 +31,8 @@ Users outside `support-ai-runbook` cannot execute the wrapper or read the token.
 
 ## Build
 
+Run this from the repository root:
+
 ```bash
 apptainer build runbook-gateway.sif apps/runbook-gateway/Apptainer.def
 ```
