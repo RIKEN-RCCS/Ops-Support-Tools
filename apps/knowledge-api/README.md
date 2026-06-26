@@ -65,6 +65,8 @@ Losing this key makes encrypted fields unrecoverable.
 
 `knowledge_api_write_token` protects the narrow runbook handoff write endpoints. Configure it through `KNOWLEDGE_API_WRITE_TOKEN_FILE`; clients send it as `Authorization: Bearer ...`. Do not expose this token in documents, Zendesk comments, logs, or screenshots.
 
+When the service runs as a non-root container user, the token file must be readable by that user through the mounted secret. The production compose setup runs `knowledge-api` with group `1000`, so keep the token file at `0640` or another equivalent group-readable mode. Check only file metadata with `stat`; do not print the token contents.
+
 ## Web Browse
 
 The same service also provides a small browser UI for human review:
