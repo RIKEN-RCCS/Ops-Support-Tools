@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hmac
 import json
 import os
 import sqlite3
@@ -327,7 +328,7 @@ def _require_write_token() -> None:
         return
     header = str(request.headers.get("Authorization") or "")
     prefix = "Bearer "
-    if not header.startswith(prefix) or header[len(prefix):].strip() != expected:
+    if not header.startswith(prefix) or not hmac.compare_digest(header[len(prefix):].strip(), expected):
         raise PermissionError("valid bearer token is required")
 
 
@@ -336,6 +337,9 @@ def _check_write_token() -> Any | None:
         _require_write_token()
     except PermissionError as exc:
         return _json_error(str(exc), 401)
+    except OSError:
+        app.logger.exception("failed to read Knowledge API write token")
+        return _json_error("write token is not available", 503)
     return None
 
 
