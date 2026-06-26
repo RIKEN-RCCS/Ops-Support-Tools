@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import time
 from typing import Any
 
@@ -21,6 +22,7 @@ RUNBOOK_REVIEW_WORKER_ENABLED = os.environ.get(
     "SUPPORT_AI_RUNBOOK_REVIEW_WORKER_ENABLED", "1"
 ).lower() in ("1", "true", "yes")
 RUNBOOK_MAX_REVISIONS = int(os.environ.get("SUPPORT_AI_RUNBOOK_MAX_REVISIONS", "2"))
+ADDITIONAL_RUNBOOK_SCHEMA_VERSION = "additional-runbook-request-v2"
 
 
 def _md_list(values: list[Any]) -> str:
@@ -35,6 +37,137 @@ def _revision_count(documents: list[dict[str, Any]]) -> int:
 
 def _has_plan(documents: list[dict[str, Any]]) -> bool:
     return any(doc.get("kind") == "runbook-plan" for doc in documents)
+
+
+def _latest_doc(documents: list[dict[str, Any]], kind: str) -> dict[str, Any] | None:
+    matches = [doc for doc in documents if doc.get("kind") == kind]
+    return matches[-1] if matches else None
+
+
+def _section_lines(markdown: str, section: str) -> list[str]:
+    match = re.search(rf"^## {re.escape(section)}\s*$", markdown, flags=re.MULTILINE)
+    if not match:
+        return []
+    rest = markdown[match.end():]
+    next_section = re.search(r"^##\s+", rest, flags=re.MULTILINE)
+    block = rest[: next_section.start()] if next_section else rest
+    lines: list[str] = []
+    for raw in block.splitlines():
+        line = raw.strip()
+        if line.startswith("- "):
+            lines.append(line[2:].strip())
+    return [line for line in lines if line and line.lower() != "none"]
+
+
+def _is_v2_additional_run(run: dict[str, Any], documents: list[dict[str, Any]]) -> bool:
+    bodies = [str(run.get("runbook") or "")]
+    bodies.extend(str(doc.get("body_md") or "") for doc in documents if doc.get("kind") == "additional-runbook-source")
+    return any(f"- schema: {ADDITIONAL_RUNBOOK_SCHEMA_VERSION}" in body for body in bodies)
+
+
+def _read_only_commands_from_points(points: list[str]) -> list[str]:
+    commands: list[str] = []
+    known_commands = (
+        "module avail compiler",
+        "module avail gcc",
+        "module avail nvhpc",
+        "module show nvhpc-hpcx/26.3",
+        "module show nvhpc-hpcx-cuda13/26.3",
+    )
+    joined = "\n".join(points).lower()
+    for command in known_commands:
+        if command.lower() in joined:
+            commands.append(command)
+    return commands
+
+
+def _has_forbidden_v2_step(value: Any) -> bool:
+    text = str(value or "").lower()
+    forbidden = (
+        "knowledge",
+        "検索",
+        "運用文書",
+        "公式ドキュメント",
+        "policy",
+        "方針",
+        "module load",
+        "which ",
+        "build",
+        "ビルド",
+        "configure",
+        "make ",
+        "cmake",
+        "job",
+        "ジョブ",
+        "sbatch",
+        "user data",
+        "ユーザーデータ",
+    )
+    return any(term in text for term in forbidden)
+
+
+def _v2_contract_satisfied(run: dict[str, Any], documents: list[dict[str, Any]]) -> bool:
+    if not _is_v2_additional_run(run, documents):
+        return False
+    plan = _latest_doc(documents, "runbook-plan")
+    if not plan:
+        return False
+    plan_body = str(plan.get("body_md") or "")
+    knowledge_queries = _section_lines(plan_body, "Knowledge Queries")
+    read_only_checks = _section_lines(plan_body, "Read-only Checks")
+    execution_steps = _section_lines(plan_body, "Execution Steps")
+    if knowledge_queries or not read_only_checks or not execution_steps:
+        return False
+    if any(_has_forbidden_v2_step(item) for item in read_only_checks + execution_steps):
+        return False
+    source_body = str(run.get("runbook") or "")
+    source_points = _section_lines(source_body, "Real-Machine Investigable Points")
+    required_commands = _read_only_commands_from_points(source_points)
+    plan_text = plan_body.lower()
+    return all(command.lower() in plan_text for command in required_commands)
+
+
+def _normalize_v2_contract_review(
+    run: dict[str, Any],
+    documents: list[dict[str, Any]],
+    risk: dict[str, Any],
+    technical: dict[str, Any],
+    chief: dict[str, Any],
+) -> dict[str, Any]:
+    if not _v2_contract_satisfied(run, documents):
+        return chief
+    if str(risk.get("verdict") or "") != "pass":
+        return chief
+    normalized = dict(chief)
+    normalized["verdict"] = "pass"
+    normalized["risk_verdict"] = "pass"
+    normalized["technical_verdict"] = "pass"
+    normalized["summary"] = (
+        "v2 child runbook contract satisfied: the plan is scoped to the requested "
+        "real-machine read-only checks only. Parent Knowledge/policy gaps remain separated."
+    )
+    normalized["risk_points"] = []
+    normalized["technical_points"] = []
+    normalized["missing_coverage"] = []
+    normalized["final_revise_requests"] = []
+    normalized["planner_patch_instructions"] = []
+    normalized["evidence_to_collect"] = _section_lines(
+        str((_latest_doc(documents, "runbook-plan") or {}).get("body_md") or ""),
+        "Execution Steps",
+    )
+    normalized["pass_conditions"] = [
+        "Execution result records the full output of each listed read-only command.",
+        "Findings/summary do not claim Knowledge/policy decisions that are separated on the parent run.",
+    ]
+    normalized["human_decision_needed"] = []
+    normalized["reviewer_conflicts"] = [
+        "Any request for parent-level Knowledge search, support policy, ABI details, or final answer completeness is outside this v2 child run scope.",
+    ]
+    normalized["operator_notes"] = (
+        "Contract-scoped override applied by review worker: this v2 child run is judged only against "
+        "Real-Machine Runbook Contract / Real-Machine Investigable Points."
+    )
+    return normalized
 
 
 def _review_body(review: dict[str, Any], *, kind: str) -> str:
@@ -227,6 +360,7 @@ def process_one(run_ref: dict[str, Any], *, verbose: bool = False) -> bool:
 
         chief_docs = common.knowledge_list_run_documents(run_id, include_body=True)
         chief = llm_client.generate_runbook_chief_review(run, chief_docs, risk, technical)
+        chief = _normalize_v2_contract_review(run, chief_docs, risk, technical, chief)
         chief_doc_id = _attach_review(run, chief, kind="chief")
 
         revision_no = _revision_count(chief_docs) + 1
