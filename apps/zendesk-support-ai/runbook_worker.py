@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import time
 from typing import Any
 
@@ -19,6 +20,7 @@ import llm_client
 
 RUNBOOK_WORKER_ENABLED = os.environ.get("SUPPORT_AI_RUNBOOK_WORKER_ENABLED", "1").lower() in ("1", "true", "yes")
 RUNBOOK_MAX_REVISIONS = int(os.environ.get("SUPPORT_AI_RUNBOOK_MAX_REVISIONS", "2"))
+ADDITIONAL_RUNBOOK_SCHEMA_VERSION = "additional-runbook-request-v2"
 
 
 GUARD_APPROVAL_REASONS = {
@@ -38,6 +40,115 @@ def _append_unique(values: list[Any], item: str) -> list[str]:
     if item not in normalized:
         normalized.append(item)
     return normalized
+
+
+def _is_v2_additional_runbook(source_run: dict[str, Any]) -> bool:
+    body = str(source_run.get("runbook") or "")
+    return f"- schema: {ADDITIONAL_RUNBOOK_SCHEMA_VERSION}" in body
+
+
+def _section_lines(markdown: str, section: str) -> list[str]:
+    match = re.search(rf"^## {re.escape(section)}\s*$", markdown, flags=re.MULTILINE)
+    if not match:
+        return []
+    rest = markdown[match.end():]
+    next_section = re.search(r"^##\s+", rest, flags=re.MULTILINE)
+    block = rest[: next_section.start()] if next_section else rest
+    lines: list[str] = []
+    for raw in block.splitlines():
+        line = raw.strip()
+        if line.startswith("- "):
+            lines.append(line[2:].strip())
+    return [line for line in lines if line and line.lower() != "none"]
+
+
+def _looks_forbidden_for_real_machine_step(value: Any) -> bool:
+    text = str(value or "").lower()
+    forbidden = (
+        "knowledge",
+        "knowledge api",
+        "knowledge/",
+        "検索",
+        "運用文書",
+        "公式ドキュメント",
+        "policy",
+        "方針",
+        "module load",
+        "which ",
+        "ビルド",
+        "build",
+        "configure",
+        "make ",
+        "cmake",
+        "ジョブ",
+        "job",
+        "sbatch",
+        "ユーザーデータ",
+        "user data",
+    )
+    return any(term in text for term in forbidden)
+
+
+def _read_only_commands_from_points(points: list[str]) -> list[str]:
+    commands: list[str] = []
+    known_commands = (
+        "module avail compiler",
+        "module avail gcc",
+        "module avail nvhpc",
+        "module show nvhpc-hpcx/26.3",
+        "module show nvhpc-hpcx-cuda13/26.3",
+    )
+    joined = "\n".join(points).lower()
+    for command in known_commands:
+        if command.lower() in joined:
+            commands.append(command)
+    return commands
+
+
+def _sanitize_v2_additional_plan(plan: dict[str, Any], *, source_run: dict[str, Any]) -> dict[str, Any]:
+    if not _is_v2_additional_runbook(source_run):
+        return plan
+
+    guarded = dict(plan)
+    source_body = str(source_run.get("runbook") or "")
+    source_points = _section_lines(source_body, "Real-Machine Investigable Points")
+    source_commands = _read_only_commands_from_points(source_points)
+
+    read_only_checks = [
+        str(item).strip()
+        for item in guarded.get("read_only_checks") or []
+        if str(item).strip() and not _looks_forbidden_for_real_machine_step(item)
+    ]
+    for command in source_commands:
+        read_only_checks = _append_unique(read_only_checks, command)
+    if not read_only_checks:
+        read_only_checks = source_points
+
+    execution_steps = [f"Run `{item}` and record the full output." for item in read_only_checks]
+
+    guarded["knowledge_queries"] = []
+    guarded["read_only_checks"] = read_only_checks
+    guarded["execution_steps"] = execution_steps
+    guarded["requires_human_approval"] = False
+    guarded["answer_draft_policy"] = "hold"
+    guarded["approval_reasons"] = []
+    guarded["risk_review"] = _append_unique(
+        list(guarded.get("risk_review") or []),
+        "v2追加runbookのため、実機手順はReal-Machine Investigable Points由来の読み取り確認だけに制限する。",
+    )
+    guarded["stop_conditions"] = [
+        "実機でのread-only commandが失敗した場合は、エラーメッセージを記録して停止する。",
+        "module load、which after load、ビルド、ジョブ投入、ユーザーデータ参照、Knowledge/運用文書検索が必要になったら、このrunbookでは実行せずissue_on_runに分離して停止する。",
+    ]
+    guarded["answer_draft_skeleton"] = (
+        "この段階では公開返信案を確定しない。Real-Machine Investigable Points由来のread-only確認で"
+        "分かった事実だけをfindings/summaryへ登録し、Knowledge/運用方針は未確認として分離する。"
+    )
+    guarded["operator_notes"] = (
+        "Worker guard applied: v2 additional runbook was sanitized to real-machine read-only checks only; "
+        "Knowledge research and human policy decisions are tracked on the parent run, not executed here."
+    )
+    return guarded
 
 
 def _guard_plan(plan: dict[str, Any], *, source_run: dict[str, Any]) -> dict[str, Any]:
@@ -73,6 +184,11 @@ def _guard_plan(plan: dict[str, Any], *, source_run: dict[str, Any]) -> dict[str
             "この段階では公開返信案を確定しない。findings / issue_on_run / summary が登録された後、"
             "確認済みの環境名、提供モジュール、サポート方針、検証結果だけを根拠として回答案を作成する。"
         )
+
+    guarded = _sanitize_v2_additional_plan(guarded, source_run=source_run)
+    approval_reasons = list(guarded.get("approval_reasons") or [])
+    risk_review = list(guarded.get("risk_review") or [])
+    stop_conditions = list(guarded.get("stop_conditions") or [])
 
     guarded["approval_reasons"] = approval_reasons
     guarded["risk_review"] = risk_review

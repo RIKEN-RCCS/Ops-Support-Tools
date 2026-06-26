@@ -75,6 +75,21 @@ a { color: #145dbf; }
 .review-point-card { background: #fff; border: 1px solid #d8dee6; padding: 12px; }
 .review-point-card h3 { margin: 0 0 8px; }
 .runbook-under-review pre { max-height: 760px; }
+.work-queue { border-left: 4px solid #145dbf; }
+.action-box { background: #fff; border: 2px solid #145dbf; padding: 14px; margin: 14px 0; }
+.action-title { font-size: 20px; font-weight: 700; margin: 0 0 6px; }
+.action-list { margin: 8px 0 0; padding-left: 20px; }
+.doc-review-grid { display: grid; gap: 10px; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); margin-top: 10px; }
+.doc-review-card { background: #f7f9fc; border: 1px solid #d8dee6; padding: 10px; }
+.doc-review-card strong { display: block; margin-bottom: 4px; }
+.priority-doc { background: #fff; border: 2px solid #d8a300; padding: 12px; margin-top: 12px; }
+.priority-doc h3 { margin: 0 0 8px; }
+.supporting-docs { display: grid; gap: 10px; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); margin-top: 10px; }
+.supporting-doc { background: #fff; border: 1px solid #d8dee6; padding: 10px; }
+.supporting-doc pre, .priority-doc pre { max-height: 360px; }
+details.panel > summary { cursor: pointer; font-weight: 700; }
+.answer-actions { border-color: #d8a300; }
+.answer-actions h2 { margin-top: 0; }
 pre { background: #101820; color: #f4f7fb; overflow: auto; padding: 14px; white-space: pre-wrap; }
 input, select, textarea, button { font: inherit; padding: 6px 8px; }
 textarea { box-sizing: border-box; min-height: 76px; width: 100%; }
@@ -164,6 +179,21 @@ DOCUMENT_KIND_GUIDE = """
       <td>Zendeskへ戻す社内メモ案または公開返信案。人間レビュー前提。</td>
     </tr>
     <tr>
+      <td><code>answer-question-evaluation</code></td>
+      <td><a href="{{ link('web_documents', q='answer-question-evaluation') }}" title="回答案が元質問に答えているかの評価を探します">Documents search</a> / operator_review run</td>
+      <td>最新answer_draftが元質問に答えているか、未回答論点・根拠なし断定・推奨アクションを評価する文書。</td>
+    </tr>
+    <tr>
+      <td><code>additional-runbook-source</code></td>
+      <td><a href="{{ link('web_documents', q='additional-runbook-source') }}" title="追加runbook生成の根拠と親run情報を探します">Documents search</a> / child run</td>
+      <td>answer評価から追加runbookを作ったときの親run、評価doc、前回成果物、追加確認スコープ。</td>
+    </tr>
+    <tr>
+      <td><code>knowledge-research-request</code></td>
+      <td><a href="{{ link('web_documents', q='knowledge-research-request') }}" title="実機ではなくKnowledge/運用文書で調べる事項を探します">Documents search</a> / parent run</td>
+      <td>実機runbookへ送らず、Knowledge/運用文書/人間方針確認で扱うべき不足事項。</td>
+    </tr>
+    <tr>
       <td><code>handoff-note</code></td>
       <td><a href="{{ link('web_handoffs') }}" title="人間、実機AI、後続AIへの受け渡し記録を表示します">Handoffs</a></td>
       <td>人間、実機AI、後続AIへ渡す補足、依頼、受け渡し記録。</td>
@@ -197,7 +227,7 @@ def _web_url(endpoint: str, **values: Any) -> str:
 
 def _fmt_ts(value: Any) -> str:
     try:
-        return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(int(value)))
+        return time.strftime("%Y-%m-%d %H:%M:%S %Z", time.localtime(int(value)))
     except (TypeError, ValueError):
         return ""
 
@@ -458,6 +488,25 @@ def web_index():
             LIMIT 8
             """
         ).fetchall()
+        work_runs = conn.execute(
+            """
+            SELECT r.*, COUNT(rd.document_id) AS document_count
+            FROM runs r
+            LEFT JOIN run_documents rd ON rd.run_id = r.id
+            WHERE r.status IN ('operator_review', 'review_passed', 'revision_requested', 'execution_failed')
+            GROUP BY r.id
+            ORDER BY
+              CASE r.status
+                WHEN 'operator_review' THEN 1
+                WHEN 'execution_failed' THEN 2
+                WHEN 'revision_requested' THEN 3
+                WHEN 'review_passed' THEN 4
+                ELSE 9
+              END,
+              r.updated_at DESC
+            LIMIT 12
+            """
+        ).fetchall()
         recent_plans = conn.execute(
             """
             SELECT d.*, rd.run_id, rd.role, rd.created_at AS linked_at
@@ -480,6 +529,26 @@ def web_index():
         "Knowledge",
         """
         <h1>Knowledge Overview</h1>
+        <div class="panel work-queue">
+          <h2>Human Work Queue</h2>
+          <div class="meta">人が見るべきrunです。Next actionは「何について何を判断するか」、Review targetは「どのカテゴリーの文書を見るか」を示します。</div>
+          <table>
+            <thead><tr><th>Run</th><th>Ticket</th><th>Status</th><th>Next action</th><th>Review target</th><th>Updated</th></tr></thead>
+            <tbody>
+            {% for run in work_runs %}
+              <tr>
+                <td><a href="{{ link('web_run_detail', run_id=run.id) }}">{{ run.id }}</a><div class="meta">{{ run.environment }} / {{ run.machine }}</div></td>
+                <td>{{ run.ticket_id or "" }}</td>
+                <td><span class="badge badge-{{ run.status }}" title="{{ run_status_help }}">{{ run.status }}</span></td>
+                <td><strong>{{ run.action.queue }}</strong><br><span class="meta">{{ run.action.next_action }}</span></td>
+                <td>{{ run.action.review_target }}</td>
+                <td>{{ fmt(run.updated_at) }}</td>
+              </tr>
+            {% endfor %}
+            </tbody>
+          </table>
+        </div>
+
         <div class="panel">
           <h2>Document Map</h2>
           <div class="meta">文章の種類ごとの入口です。runbookの状態を見るときは Runs、文章そのものを探すときは Documents を使います。</div>
@@ -573,6 +642,7 @@ def web_index():
         </table>
         """,
         counts=counts,
+        work_runs=[_run_row_to_dict(row) | {"action": _run_list_action(_run_row_to_dict(row))} for row in work_runs],
         recent_runs=[_run_row_to_dict(row) for row in recent_runs],
         recent_plans=[_row_to_dict(row) | {"run_id": row["run_id"], "role": row["role"], "linked_at": row["linked_at"]} for row in recent_plans],
         recent_docs=[_row_to_dict(row) for row in recent_docs],
@@ -718,10 +788,16 @@ def web_runs():
             params,
         ).fetchall()
     runs = [_run_row_to_dict(row) for row in rows]
+    for run in runs:
+        run["action"] = _run_list_action(run)
     return _render(
         "Runs",
         """
         <h1>Runs</h1>
+        <div class="panel work-queue">
+          <h2>Work Queue</h2>
+          <div class="meta">この一覧は「どのrunで、どの種類の文書を、何の判断のために見るか」を優先して表示します。本文は各run詳細のAction RequiredとDocumentsから確認します。</div>
+        </div>
         <div class="panel">
           <div class="quick-links">
             <a href="{{ link('web_runs') }}" title="すべての調査runを表示します">all</a>
@@ -746,7 +822,7 @@ def web_runs():
           <button type="submit">Filter</button>
         </form>
         <table>
-          <thead><tr><th>ID</th><th>Ticket</th><th>Environment</th><th>Machine</th><th>Status</th><th>Summary</th><th>Docs</th><th>Document kinds</th><th>Updated</th></tr></thead>
+          <thead><tr><th>ID</th><th>Ticket</th><th>Environment</th><th>Machine</th><th>Status</th><th>Next action</th><th>Review target</th><th>Summary</th><th>Docs</th><th>Updated</th></tr></thead>
           <tbody>
           {% for run in runs %}
             <tr>
@@ -755,9 +831,10 @@ def web_runs():
               <td>{{ run.environment }}</td>
               <td>{{ run.machine }}</td>
               <td><span class="badge badge-{{ run.status }}" title="{{ run_status_help }}">{{ run.status }}</span>{% if run.claimed_by %}<br><span class="meta">claimed by {{ run.claimed_by }} until {{ fmt(run.lease_until) }}</span>{% endif %}</td>
+              <td><strong>{{ run.action.queue }}</strong><br><span class="meta">{{ run.action.next_action }}</span></td>
+              <td>{{ run.action.review_target }}<br><span class="meta">{{ run.document_kinds }}</span></td>
               <td>{{ run.summary }}</td>
               <td>{{ run.document_count }}</td>
-              <td>{{ run.document_kinds }}</td>
               <td>{{ fmt(run.updated_at) }}</td>
             </tr>
           {% endfor %}
@@ -996,6 +1073,156 @@ def _run_execution_results(run: dict[str, Any], documents: list[dict[str, Any]])
     }
 
 
+def _run_list_action(run: dict[str, Any]) -> dict[str, str]:
+    status = str(run.get("status") or "")
+    if status == "operator_review":
+        return {
+            "queue": "Human review",
+            "next_action": "実行成果物を査読し、返信可否・追加調査・保留を判断",
+            "review_target": "findings / issue_on_run / summary / answer_draft",
+        }
+    if status == "review_passed":
+        return {
+            "queue": "Ready for execution",
+            "next_action": "実機作業者またはgatewayがclaimしてrunbookを実行",
+            "review_target": "runbook-plan",
+        }
+    if status == "revision_requested":
+        return {
+            "queue": "Needs revision",
+            "next_action": "差し戻し指摘を反映したrunbook再生成を待つ、または人間が補足",
+            "review_target": "runbook-revision-request / human-revision-request",
+        }
+    if status in {"review_requested", "risk_reviewing", "technical_reviewing"}:
+        return {
+            "queue": "AI review",
+            "next_action": "risk / technical / chief reviewの完了待ち",
+            "review_target": "runbook-plan",
+        }
+    if status in {"requested", "planning"}:
+        return {
+            "queue": "Planning",
+            "next_action": "runbook生成待ち、machine/environment不足なら補足",
+            "review_target": "ticket context / run metadata",
+        }
+    if status == "executing":
+        return {
+            "queue": "In execution",
+            "next_action": "claim保持者がheartbeat、結果登録、またはrelease",
+            "review_target": "runbook-plan / execution-result",
+        }
+    if status == "execution_failed":
+        return {
+            "queue": "Failed execution",
+            "next_action": "失敗理由を確認し、追加runbookか人間保留に分岐",
+            "review_target": "issue_on_run / findings",
+        }
+    if status == "closed":
+        return {
+            "queue": "Closed",
+            "next_action": "完了済み。必要なら文書だけ参照",
+            "review_target": "final documents",
+        }
+    return {
+        "queue": "Other",
+        "next_action": "状態を確認",
+        "review_target": "attached documents",
+    }
+
+
+def _run_action_context(
+    run: dict[str, Any],
+    documents: list[dict[str, Any]],
+    review_focus: dict[str, Any],
+    execution_results: dict[str, Any],
+) -> dict[str, Any]:
+    action = _run_list_action(run)
+    latest_by_kind = {kind: _latest_document(documents, kind) for kind in (
+        "runbook-plan",
+        "runbook-chief-review",
+        "runbook-revision-request",
+        "human-revision-request",
+        "answer-question-evaluation",
+        "findings",
+        "issue_on_run",
+        "summary",
+        "answer_draft",
+    )}
+
+    def package_doc(kind: str, label: str, why: str) -> dict[str, Any] | None:
+        document = latest_by_kind.get(kind)
+        if not document:
+            return None
+        body = _markdown_body_without_leading_meta(str(document.get("body_md") or ""))
+        return {
+            "kind": kind,
+            "label": label,
+            "why": why,
+            "document": document,
+            "body": body,
+            "points": _brief_items(body, limit=5, width=280),
+        }
+
+    primary_docs: list[dict[str, Any]] = []
+    if run.get("status") == "operator_review":
+        primary_docs = [
+            {"label": "Answer draft", "why": "Zendeskへ戻せる文案か確認", "document": latest_by_kind["answer_draft"]},
+            {"label": "Findings", "why": "文案の根拠になる確認済み事実", "document": latest_by_kind["findings"]},
+            {"label": "Issue on run", "why": "未確認・失敗・制約を踏み越えていないか確認", "document": latest_by_kind["issue_on_run"]},
+            {"label": "Summary", "why": "調査全体の短い結論", "document": latest_by_kind["summary"]},
+        ]
+        decisions = [
+            "answer_draftをZendesk返信に使えるか判断",
+            "findingsとanswer_draftの対応を確認",
+            "issue_on_runに未解決の重要事項があれば追加runbookまたはhuman holdへ分岐",
+            "LLMの言い過ぎ・未確認の断定・環境固有知識の欠落を指摘",
+        ]
+    elif run.get("status") == "review_passed":
+        primary_docs = [
+            {"label": "Runbook plan", "why": "実機作業者/gatewayが実行する計画", "document": latest_by_kind["runbook-plan"]},
+            {"label": "Chief review", "why": "許可範囲・停止条件・集める根拠", "document": latest_by_kind["runbook-chief-review"]},
+        ]
+        decisions = [
+            "gatewayでclaimしてrunbookを取得",
+            "許可された読み取り系確認だけを実行",
+            "findings / issue_on_run / summary / answer_draftを登録",
+        ]
+    elif run.get("status") == "revision_requested":
+        primary_docs = [
+            {"label": "Revision request", "why": "runbookに反映すべき主査・人間の指摘", "document": latest_by_kind["runbook-revision-request"]},
+            {"label": "Human request", "why": "人間がまとめて指定したMust Fix", "document": latest_by_kind["human-revision-request"]},
+            {"label": "Runbook plan", "why": "修正対象の計画", "document": latest_by_kind["runbook-plan"]},
+        ]
+        decisions = [
+            "Must Fixがrunbook再生成に渡っているか確認",
+            "必要なら人間が補足指示を追加",
+        ]
+    else:
+        primary_docs = [
+            {"label": "Runbook plan", "why": "このrunの中心文書", "document": latest_by_kind["runbook-plan"]},
+            {"label": "Chief review", "why": "レビュー結果の統合", "document": latest_by_kind["runbook-chief-review"]},
+            {"label": "Answer draft", "why": "Zendeskへ戻す候補文", "document": latest_by_kind["answer_draft"]},
+        ]
+        decisions = [action["next_action"]]
+
+    primary_docs = [item for item in primary_docs if item.get("document")]
+    operator_package = [
+        package_doc("answer-question-evaluation", "Answer question evaluation", "元質問に答えているかのLLM評価。人間レビューの入口。"),
+        package_doc("answer_draft", "Answer draft", "Zendeskへ戻す候補文。まずこれを読む。"),
+        package_doc("findings", "Findings", "回答案の根拠となる確認済み事実。"),
+        package_doc("issue_on_run", "Issue on run", "未確認事項・停止理由・実行上の制約。"),
+        package_doc("summary", "Summary", "調査全体の短いまとめ。"),
+    ]
+    return {
+        **action,
+        "decisions": decisions,
+        "primary_docs": primary_docs,
+        "operator_package": [item for item in operator_package if item],
+        "has_execution_results": bool(execution_results.get("cards")),
+        "chief_verdict": review_focus.get("chief_verdict") or "",
+    }
+
+
 @app.get("/runs/<run_id>/view")
 @app.get("/knowledge/runs/<run_id>/view")
 def web_run_detail(run_id: str):
@@ -1024,6 +1251,7 @@ def web_run_detail(run_id: str):
         documents.append(doc)
     review_focus = _run_review_focus(documents)
     execution_results = _run_execution_results(run, documents)
+    action_context = _run_action_context(run, documents, review_focus, execution_results)
     return _render(
         f"Run {run_id}",
         """
@@ -1040,8 +1268,118 @@ def web_run_detail(run_id: str):
             {% endfor %}
           </div>
         </div>
+        <div class="action-box">
+          <div class="action-title">
+            {% if run.status == "operator_review" %}
+              Action Required: Answer Review
+            {% else %}
+              Action Required: {{ action_context.queue }}
+            {% endif %}
+          </div>
+          {% if run.status == "operator_review" %}
+            <p>このrunbookは実行・結果登録まで完了しています。ここではZendeskへ戻す回答案だけを確認し、返信へ進めるか、回答修正か、追加調査かを判断します。</p>
+          {% else %}
+            <p>{{ action_context.next_action }}</p>
+          {% endif %}
+          <div class="meta">Review target: {{ action_context.review_target }}{% if action_context.chief_verdict %} / chief verdict={{ action_context.chief_verdict }}{% endif %}</div>
+          {% if action_context.decisions %}
+          <strong>Human decision points</strong>
+          <ul class="action-list">
+            {% for item in action_context.decisions %}
+              <li>{{ item }}</li>
+            {% endfor %}
+          </ul>
+          {% endif %}
+          {% if action_context.primary_docs %}
+          <div class="doc-review-grid">
+            {% for item in action_context.primary_docs %}
+            <div class="doc-review-card">
+              <strong>{{ item.label }}</strong>
+              <a href="{{ link('web_document_detail', doc_id=item.document.id) }}">{{ item.document.title }}</a>
+              <div class="meta">{{ item.why }}<br>kind={{ item.document.kind }} role={{ item.document.role }}</div>
+            </div>
+            {% endfor %}
+          </div>
+          {% endif %}
+          {% if run.status == "operator_review" and action_context.operator_package %}
+            {% for item in action_context.operator_package %}
+              {% if item.kind == "answer-question-evaluation" %}
+              <section class="priority-doc">
+                <h3>{{ item.label }}: Does this answer the question?</h3>
+                <div class="meta">
+                  <a href="{{ link('web_document_detail', doc_id=item.document.id) }}">{{ item.document.title }}</a><br>
+                  {{ item.why }} / kind={{ item.document.kind }} role={{ item.document.role }}
+                </div>
+                {% if item.points %}
+                <ul class="issue-list">
+                  {% for point in item.points %}
+                    <li>{{ point }}</li>
+                  {% endfor %}
+                </ul>
+                {% else %}
+                <pre>{{ item.body }}</pre>
+                {% endif %}
+              </section>
+              {% endif %}
+            {% endfor %}
+            {% for item in action_context.operator_package %}
+              {% if item.kind == "answer_draft" %}
+              <section class="priority-doc">
+                <h3>{{ item.label }}: Zendesk reply candidate</h3>
+                <div class="meta">
+                  <a href="{{ link('web_document_detail', doc_id=item.document.id) }}">{{ item.document.title }}</a><br>
+                  {{ item.why }} / kind={{ item.document.kind }} role={{ item.document.role }}
+                </div>
+                <pre>{{ item.body }}</pre>
+              </section>
+              {% endif %}
+            {% endfor %}
+            <div class="supporting-docs">
+              {% for item in action_context.operator_package %}
+                {% if item.kind != "answer_draft" and item.kind != "answer-question-evaluation" %}
+                <section class="supporting-doc">
+                  <h3>{{ item.label }}</h3>
+                  <div class="meta">
+                    <a href="{{ link('web_document_detail', doc_id=item.document.id) }}">{{ item.document.title }}</a><br>
+                    {{ item.why }} / kind={{ item.document.kind }}
+                  </div>
+                  {% if item.points %}
+                  <ul class="issue-list">
+                    {% for point in item.points %}
+                      <li>{{ point }}</li>
+                    {% endfor %}
+                  </ul>
+                  {% else %}
+                  <pre>{{ item.body }}</pre>
+                  {% endif %}
+                </section>
+                {% endif %}
+              {% endfor %}
+            </div>
+          {% endif %}
+        </div>
+
+        {% if run.status == "operator_review" %}
+        <div class="panel work-queue">
+          <h2>Answer Review Checklist</h2>
+          <div class="meta">runbook planや実行前reviewは履歴です。ここでは回答案に集中してください。</div>
+          <ul class="action-list">
+            <li>answer_draftがfindingsに基づいているか。</li>
+            <li>issue_on_runに未解決の制約があるのに断定していないか。</li>
+            <li>実行していないmodule load、build、job投入、ユーザーデータ参照を確認済みとしていないか。</li>
+            <li>LLMの一般論が環境固有の事実より前に出ていないか。</li>
+            <li>足りない場合は文案修正ではなく、追加runbookまたは人間保留に分岐する。</li>
+          </ul>
+        </div>
+        {% endif %}
+        {% if run.status == "operator_review" %}
+        <details class="panel">
+          <summary>Closed runbook/review history</summary>
+          <div class="meta">このrunbookはすでに実行前reviewを通過しています。answer判断で必要な場合だけ開いて確認します。</div>
+        {% else %}
         <div class="panel">
-          <h2>Review Focus</h2>
+        {% endif %}
+          <h2>Runbook Review History</h2>
           <div class="meta">上段は主査が統合した人間レビューポイント、下段はレビュー対象の最新runbook本文です。risk/technicalの個別査読はDocumentリンクから確認できます。</div>
           {% if review_focus.chief_document %}
           <section class="review-point-card">
@@ -1194,8 +1532,18 @@ def web_run_detail(run_id: str):
           {% else %}
           <p class="meta">runbook planがまだ添付されていません。</p>
           {% endif %}
+        {% if run.status == "operator_review" %}
+        </details>
+        {% else %}
         </div>
+        {% endif %}
+        {% if run.status == "operator_review" %}
+        <details class="panel">
+          <summary>Execution results and evidence</summary>
+          <div class="meta">回答案の根拠確認が必要な場合だけ開きます。主な根拠は上のfindings / issue_on_run / summaryカードにも出ています。</div>
+        {% else %}
         <div class="panel">
+        {% endif %}
           <h2>Execution Results</h2>
           <div class="meta">どのrunbookを実行して何が分かったかを見る場所です。各カードは実行結果documentで、対象runbookと要点を一緒に表示します。</div>
           {% if execution_results.cards %}
@@ -1226,11 +1574,51 @@ def web_run_detail(run_id: str):
           {% else %}
             <p class="meta">まだ実行結果は登録されていません。runbook実行後に Register Execution Result から findings / issue_on_run / summary / answer_draft を登録してください。</p>
           {% endif %}
-        </div>
         {% if run.status == "operator_review" %}
-        <div class="panel danger">
-          <h2>Operator Actions</h2>
-          <div class="meta">AIが自動処理を止めたrunです。ここで行う操作はKnowledge上の状態更新とhandoff記録だけで、実機操作やZendesk返信は行いません。</div>
+        </details>
+        {% else %}
+        </div>
+        {% endif %}
+        {% if run.status == "operator_review" %}
+        <div class="panel answer-actions">
+          <h2>Answer Actions</h2>
+          <div class="meta">ここで行う操作はKnowledge上の状態更新とhandoff記録だけです。Zendeskへ自動投稿はしません。</div>
+
+          <form method="post" action="{{ link('web_run_operator_action', run_id=run.id) }}" class="panel">
+            <input type="hidden" name="action" value="create_zendesk_draft_handoff">
+            <h3>Queue Zendesk Draft</h3>
+            <label>Operator note<br><textarea name="note" placeholder="この回答案をZendesk下書きとして人間確認へ進める根拠"></textarea></label>
+            <div class="form-actions"><button type="submit">Create Zendesk Draft Handoff</button></div>
+          </form>
+
+          <form method="post" action="{{ link('web_run_operator_action', run_id=run.id) }}" class="panel">
+            <input type="hidden" name="action" value="hold_answer_review">
+            <h3>Hold For Human Decision</h3>
+            <label>Reason<br><textarea name="note" placeholder="運用判断、公開可否、サポート範囲など、人間判断が必要な理由"></textarea></label>
+            <div class="form-actions"><button type="submit">Record Hold</button></div>
+          </form>
+
+          <form method="post" action="{{ link('web_run_operator_action', run_id=run.id) }}" class="panel">
+            <input type="hidden" name="action" value="create_additional_runbook">
+            <h3>Request Additional Runbook</h3>
+            <div class="form-grid">
+              <label>Environment<br><input name="environment" value="{{ run.environment }}"></label>
+              <label>Machine<br><input name="machine" value="{{ run.machine }}"></label>
+            </div>
+            <label>Additional scope<br><textarea name="note" placeholder="回答するには何が不足していて、次のrunbookで何を確認してほしいか。answer-question-evaluationの未回答論点を元に書く"></textarea></label>
+            <div class="form-actions"><button type="submit">Create Additional Runbook</button></div>
+          </form>
+
+          <form method="post" action="{{ link('web_run_operator_action', run_id=run.id) }}" class="panel">
+            <input type="hidden" name="action" value="close_run">
+            <h3>Close Run</h3>
+            <label>Reason<br><textarea name="note" placeholder="終了理由、別runへ統合した場合のIDなど"></textarea></label>
+            <div class="form-actions"><button type="submit">Close</button></div>
+          </form>
+        </div>
+        <details class="panel">
+          <summary>Advanced runbook actions</summary>
+          <div class="meta">runbook planそのものを差し戻す必要がある場合だけ使います。answer修正や追加調査とは別です。</div>
 
           <form method="post" action="{{ link('web_run_operator_action', run_id=run.id) }}" class="panel">
             <input type="hidden" name="action" value="set_target_revision">
@@ -1253,34 +1641,23 @@ def web_run_detail(run_id: str):
           </form>
 
           <form method="post" action="{{ link('web_run_operator_action', run_id=run.id) }}" class="panel">
-            <input type="hidden" name="action" value="handoff_real_machine">
-            <h3>Handoff To Real-Machine Agent</h3>
-            <div class="form-grid">
-              <label>Recipient<br><input name="recipient" value="real-machine-agent"></label>
-              <label>Environment<br><input name="environment" value="{{ run.environment }}"></label>
-              <label>Machine<br><input name="machine" value="{{ run.machine }}"></label>
-            </div>
-            <label>Request note<br><textarea name="note" placeholder="実機AI/実機作業者に確認してほしいこと"></textarea></label>
-            <div class="form-actions"><button type="submit">Create Handoff</button></div>
-          </form>
-
-          <form method="post" action="{{ link('web_run_operator_action', run_id=run.id) }}" class="panel">
             <input type="hidden" name="action" value="mark_review_passed">
             <h3>Mark Review Passed</h3>
             <label>Operator note<br><textarea name="note" placeholder="人間判断で実行前確認へ進める根拠"></textarea></label>
             <div class="form-actions"><button type="submit">Mark Review Passed</button></div>
           </form>
 
-          <form method="post" action="{{ link('web_run_operator_action', run_id=run.id) }}" class="panel">
-            <input type="hidden" name="action" value="close_run">
-            <h3>Close Run</h3>
-            <label>Reason<br><textarea name="note" placeholder="終了理由、別runへ統合した場合のIDなど"></textarea></label>
-            <div class="form-actions"><button type="submit">Close</button></div>
-          </form>
-        </div>
+        </details>
         {% endif %}
+        {% if run.status == "operator_review" %}
+        <details class="panel">
+          <summary>Initial runbook request</summary>
+          <pre>{{ run.runbook }}</pre>
+        </details>
+        {% else %}
         <h2>Runbook</h2>
         <pre>{{ run.runbook }}</pre>
+        {% endif %}
         {% if run.status != "closed" %}
         <div class="panel">
           <h2>Register Execution Result</h2>
@@ -1339,6 +1716,7 @@ def web_run_detail(run_id: str):
         documents=documents,
         review_focus=review_focus,
         execution_results=execution_results,
+        action_context=action_context,
         fmt=_fmt_ts,
         run_status_help=RUN_STATUS_HELP,
     )
@@ -1569,6 +1947,104 @@ def _update_run_fields(run_id: str, updates: dict[str, Any]) -> None:
         conn.execute(f"UPDATE runs SET {assignments} WHERE id = :id", updates)
 
 
+def _latest_run_document(run_id: str, kind: str, *, include_body: bool = False) -> dict[str, Any] | None:
+    with _connect() as conn:
+        row = conn.execute(
+            """
+            SELECT d.*, rd.role, rd.created_at AS linked_at
+            FROM run_documents rd
+            JOIN documents d ON d.id = rd.document_id
+            WHERE rd.run_id = ? AND d.kind = ?
+            ORDER BY rd.created_at DESC
+            LIMIT 1
+            """,
+            (run_id, kind),
+        ).fetchone()
+    if not row:
+        return None
+    doc = _row_to_dict(row)
+    doc["role"] = row["role"]
+    doc["linked_at"] = row["linked_at"]
+    if include_body:
+        doc["body_md"] = _document_body(row)
+    return doc
+
+
+def _create_document_handoff(
+    *,
+    document_id: str,
+    run: dict[str, Any],
+    channel: str,
+    recipient: str,
+    note: str,
+) -> dict[str, Any]:
+    handoff_id = str(uuid.uuid4())
+    now = _now()
+    with _connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO document_handoffs
+              (id, document_id, ticket_id, environment, machine, channel, recipient, status, note, note_ciphertext, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                handoff_id,
+                document_id,
+                run.get("ticket_id"),
+                run.get("environment") or "",
+                run.get("machine") or "",
+                channel,
+                recipient,
+                "requested",
+                "",
+                field_crypto.encrypt_text(note),
+                now,
+                now,
+            ),
+        )
+    return {
+        "id": handoff_id,
+        "document_id": document_id,
+        "channel": channel,
+        "recipient": recipient,
+        "status": "requested",
+    }
+
+
+def _create_run_record(payload: dict[str, Any]) -> dict[str, Any]:
+    run_id = str(payload.get("id") or uuid.uuid4())
+    now = _now()
+    key = field_crypto.load_key()
+    record = {
+        "id": run_id,
+        "ticket_id": payload.get("ticket_id"),
+        "environment": str(payload.get("environment") or ""),
+        "machine": str(payload.get("machine") or ""),
+        "runbook": "",
+        "runbook_ciphertext": field_crypto.encrypt_text(str(payload.get("runbook") or ""), key=key),
+        "status": str(payload.get("status") or "created"),
+        "issue_on_run": "",
+        "issue_on_run_ciphertext": field_crypto.encrypt_text(str(payload.get("issue_on_run") or ""), key=key),
+        "summary": "",
+        "summary_ciphertext": field_crypto.encrypt_text(str(payload.get("summary") or ""), key=key),
+        "created_at": now,
+        "updated_at": now,
+    }
+    with _connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO runs
+              (id, ticket_id, environment, machine, runbook, runbook_ciphertext, status,
+               issue_on_run, issue_on_run_ciphertext, summary, summary_ciphertext, created_at, updated_at)
+            VALUES
+              (:id, :ticket_id, :environment, :machine, :runbook, :runbook_ciphertext, :status,
+               :issue_on_run, :issue_on_run_ciphertext, :summary, :summary_ciphertext, :created_at, :updated_at)
+            """,
+            record,
+        )
+    return _run_row_to_dict(record)
+
+
 @app.post("/runs/<run_id>/operator-action")
 @app.post("/knowledge/runs/<run_id>/operator-action")
 def web_run_operator_action(run_id: str):
@@ -1581,8 +2057,150 @@ def web_run_operator_action(run_id: str):
     action = str(request.form.get("action") or "").strip()
     note = str(request.form.get("note") or "").strip()
     now_text = _fmt_ts(_now())
+    redirect_run_id = run_id
 
-    if action == "set_target_revision":
+    if action == "create_zendesk_draft_handoff":
+        answer_doc = _latest_run_document(run_id, "answer_draft")
+        if not answer_doc:
+            return _json_error("answer_draft document not found", 400)
+        handoff = _create_document_handoff(
+            document_id=str(answer_doc["id"]),
+            run=run,
+            channel="zendesk-draft",
+            recipient="support-agent",
+            note=note or "Operator requested Zendesk draft review from latest answer_draft.",
+        )
+        summary = "Operator queued latest answer_draft for Zendesk draft review."
+        body = (
+            "# Zendesk Draft Handoff Requested\n\n"
+            f"- at: {now_text}\n"
+            f"- answer_document_id: {answer_doc['id']}\n"
+            f"- handoff_id: {handoff['id']}\n"
+            "- channel: zendesk-draft\n"
+            "- next_status: operator_review\n\n"
+            "## Note\n"
+            f"{note or 'none'}\n"
+        )
+        _attach_operator_note(
+            run,
+            title=f"Zendesk draft handoff requested for run {run_id}",
+            summary=summary,
+            body_md=body,
+            role="zendesk_draft_handoff_request",
+            kind="operator-note",
+            tags=["operator-note", "zendesk-draft", "answer-action"],
+        )
+        _update_run_fields(run_id, {
+            "summary": "",
+            "_summary_plain": summary,
+        })
+    elif action == "create_additional_runbook":
+        environment = str(request.form.get("environment") or run.get("environment") or "").strip()
+        machine = str(request.form.get("machine") or run.get("machine") or "").strip()
+        evaluation_doc = _latest_run_document(run_id, "answer-question-evaluation", include_body=True)
+        findings_doc = _latest_run_document(run_id, "findings", include_body=True)
+        issue_doc = _latest_run_document(run_id, "issue_on_run", include_body=True)
+        summary_doc = _latest_run_document(run_id, "summary", include_body=True)
+        answer_doc = _latest_run_document(run_id, "answer_draft", include_body=True)
+        summary = "Additional runbook requested from answer evaluation."
+        initial_runbook = (
+            "# Additional Runbook Request\n\n"
+            f"- parent_run_id: {run_id}\n"
+            f"- ticket_id: {run.get('ticket_id') or ''}\n"
+            f"- environment: {environment}\n"
+            f"- machine: {machine}\n"
+            "- trigger: answer-question-evaluation indicated the current answer does not safely answer the user question\n\n"
+            "## Operator Scope\n"
+            f"{note or 'answer-question-evaluationのunanswered_points / missing evidenceを確認し、回答可能な根拠を追加で集める。'}\n\n"
+            "## Previous Answer Evaluation\n"
+            f"{str((evaluation_doc or {}).get('body_md') or 'none').strip()}\n\n"
+            "## Previous Findings\n"
+            f"{str((findings_doc or {}).get('body_md') or 'none').strip()}\n\n"
+            "## Previous Issue On Run\n"
+            f"{str((issue_doc or {}).get('body_md') or 'none').strip()}\n\n"
+            "## Previous Summary\n"
+            f"{str((summary_doc or {}).get('body_md') or 'none').strip()}\n\n"
+            "## Previous Answer Draft\n"
+            f"{str((answer_doc or {}).get('body_md') or 'none').strip()}\n\n"
+            "## Required Output\n"
+            "- findings: 追加確認で分かった事実。前回findingsとの差分を明記する。\n"
+            "- issue_on_run: 未確認事項、止めた理由、実行しなかった操作。\n"
+            "- summary: これで元質問にどこまで答えられるか。\n"
+            "- answer_draft: 確認済み事実だけに基づく更新回答案。\n"
+        )
+        child_run = _create_run_record({
+            "ticket_id": run.get("ticket_id"),
+            "environment": environment,
+            "machine": machine,
+            "status": "requested",
+            "summary": summary,
+            "runbook": initial_runbook,
+        })
+        source_body = (
+            "# Additional Runbook Source\n\n"
+            f"- at: {now_text}\n"
+            f"- parent_run_id: {run_id}\n"
+            f"- child_run_id: {child_run['id']}\n"
+            f"- answer_evaluation_document_id: {str((evaluation_doc or {}).get('id') or '')}\n\n"
+            "## Operator Scope\n"
+            f"{note or 'none'}\n\n"
+            "## Source Evaluation\n"
+            f"{str((evaluation_doc or {}).get('body_md') or 'none').strip()}\n"
+        )
+        _attach_run_document(
+            child_run,
+            title=f"Additional runbook source from parent {run_id}",
+            summary="Source context for additional runbook generated from answer evaluation.",
+            body_md=source_body,
+            role="additional_runbook_source",
+            kind="additional-runbook-source",
+            tags=["additional-runbook", "answer-evaluation", "parent-run"],
+        )
+        _attach_operator_note(
+            run,
+            title=f"Additional runbook requested from run {run_id}",
+            summary=f"Created child run {child_run['id']} from answer evaluation.",
+            body_md=(
+                "# Additional Runbook Requested\n\n"
+                f"- at: {now_text}\n"
+                f"- child_run_id: {child_run['id']}\n"
+                f"- answer_evaluation_document_id: {str((evaluation_doc or {}).get('id') or '')}\n"
+                "- next_status: operator_review\n\n"
+                "## Operator Scope\n"
+                f"{note or 'none'}\n"
+            ),
+            role="additional_runbook_request",
+            kind="operator-note",
+            tags=["operator-note", "additional-runbook", "answer-action"],
+        )
+        _update_run_fields(run_id, {
+            "summary": "",
+            "_summary_plain": f"Additional runbook requested: {child_run['id']}",
+        })
+        redirect_run_id = str(child_run["id"])
+    elif action == "hold_answer_review":
+        summary = "Operator held answer review for human decision."
+        body = (
+            "# Answer Review Hold\n\n"
+            f"- at: {now_text}\n"
+            "- next_status: operator_review\n\n"
+            "## Reason\n"
+            f"{note or 'none'}\n"
+        )
+        _attach_operator_note(
+            run,
+            title=f"Answer review hold for run {run_id}",
+            summary=summary,
+            body_md=body,
+            role="answer_review_hold",
+            kind="operator-note",
+            tags=["operator-note", "answer-review", "human-hold"],
+        )
+        _update_run_fields(run_id, {
+            "summary": "",
+            "_summary_plain": summary,
+        })
+    elif action == "set_target_revision":
         environment = str(request.form.get("environment") or "").strip()
         machine = str(request.form.get("machine") or "").strip()
         must_fix = str(request.form.get("must_fix") or "").strip()
@@ -1756,7 +2374,7 @@ def web_run_operator_action(run_id: str):
         )
     else:
         return _json_error("unknown operator action", 400)
-    return redirect(_web_url("web_run_detail", run_id=run_id))
+    return redirect(_web_url("web_run_detail", run_id=redirect_run_id))
 
 
 @app.get("/handoffs")
@@ -2150,37 +2768,8 @@ def update_document_handoff(handoff_id: str):
 def create_run():
     _init_db()
     payload = request.get_json(silent=True) or {}
-    run_id = str(payload.get("id") or uuid.uuid4())
-    now = _now()
-    key = field_crypto.load_key()
-    record = {
-        "id": run_id,
-        "ticket_id": payload.get("ticket_id"),
-        "environment": str(payload.get("environment") or ""),
-        "machine": str(payload.get("machine") or ""),
-        "runbook": "",
-        "runbook_ciphertext": field_crypto.encrypt_text(str(payload.get("runbook") or ""), key=key),
-        "status": str(payload.get("status") or "created"),
-        "issue_on_run": "",
-        "issue_on_run_ciphertext": field_crypto.encrypt_text(str(payload.get("issue_on_run") or ""), key=key),
-        "summary": "",
-        "summary_ciphertext": field_crypto.encrypt_text(str(payload.get("summary") or ""), key=key),
-        "created_at": now,
-        "updated_at": now,
-    }
-    with _connect() as conn:
-        conn.execute(
-            """
-            INSERT INTO runs
-              (id, ticket_id, environment, machine, runbook, runbook_ciphertext, status,
-               issue_on_run, issue_on_run_ciphertext, summary, summary_ciphertext, created_at, updated_at)
-            VALUES
-              (:id, :ticket_id, :environment, :machine, :runbook, :runbook_ciphertext, :status,
-               :issue_on_run, :issue_on_run_ciphertext, :summary, :summary_ciphertext, :created_at, :updated_at)
-            """,
-            record,
-        )
-    return jsonify({"ok": True, "run": _run_row_to_dict(record)}), 201
+    run = _create_run_record(payload)
+    return jsonify({"ok": True, "run": run}), 201
 
 
 @app.get("/api/runs")

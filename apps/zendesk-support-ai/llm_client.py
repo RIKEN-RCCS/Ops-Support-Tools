@@ -351,6 +351,79 @@ RUNBOOK_CHIEF_REVIEW_SCHEMA: Dict[str, Any] = {
 }
 
 
+RUNBOOK_ANSWER_SYNTHESIS_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "quality": {"type": "string", "enum": ["usable", "superficial", "unsafe", "needs_more_findings"]},
+        "confidence": {"type": "string", "enum": ANSWER_CONFIDENCES},
+        "safe_to_send": {"type": "boolean"},
+        "review_notes": {"type": "array", "items": {"type": "string"}},
+        "missing_evidence": {"type": "array", "items": {"type": "string"}},
+        "followup_runbook_needed": {"type": "boolean"},
+        "followup_scope": {"type": "string"},
+        "answer_draft": {"type": "string"},
+        "operator_notes": {"type": "string"},
+    },
+    "required": [
+        "quality",
+        "confidence",
+        "safe_to_send",
+        "review_notes",
+        "missing_evidence",
+        "followup_runbook_needed",
+        "followup_scope",
+        "answer_draft",
+        "operator_notes",
+    ],
+    "additionalProperties": False,
+}
+
+
+ANSWER_QUESTION_EVALUATION_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "verdict": {"type": "string", "enum": ["answers_question", "partially_answers", "does_not_answer", "unsafe_to_send"]},
+        "confidence": {"type": "string", "enum": ANSWER_CONFIDENCES},
+        "question_summary": {"type": "string"},
+        "answer_summary": {"type": "string"},
+        "covered_points": {"type": "array", "items": {"type": "string"}},
+        "unanswered_points": {"type": "array", "items": {"type": "string"}},
+        "unsupported_claims": {"type": "array", "items": {"type": "string"}},
+        "overstatements": {"type": "array", "items": {"type": "string"}},
+        "recommended_operator_action": {
+            "type": "string",
+            "enum": ["approve_reply", "revise_answer", "request_additional_runbook", "hold_for_human_decision"],
+        },
+        "runbook_investigable_points": {"type": "array", "items": {"type": "string"}},
+        "real_machine_investigable_points": {"type": "array", "items": {"type": "string"}},
+        "knowledge_research_points": {"type": "array", "items": {"type": "string"}},
+        "human_decision_points": {"type": "array", "items": {"type": "string"}},
+        "additional_runbook_scope": {"type": "string"},
+        "revision_instructions": {"type": "array", "items": {"type": "string"}},
+        "operator_notes": {"type": "string"},
+    },
+    "required": [
+        "verdict",
+        "confidence",
+        "question_summary",
+        "answer_summary",
+        "covered_points",
+        "unanswered_points",
+        "unsupported_claims",
+        "overstatements",
+        "recommended_operator_action",
+        "runbook_investigable_points",
+        "real_machine_investigable_points",
+        "knowledge_research_points",
+        "human_decision_points",
+        "additional_runbook_scope",
+        "revision_instructions",
+        "operator_notes",
+    ],
+    "additionalProperties": False,
+}
+
+
 def _api_key() -> str:
     key = env_secret("LLM_API_KEY")
     if not key:
@@ -800,6 +873,14 @@ def generate_runbook_plan(run: Dict[str, Any], *, model: Optional[str] = None) -
         "Human Decision Neededがnoneまたは空の場合、人間に改訂内容を考えさせる前提にしないでください。"
         "Nice To Fixは可能なら反映し、反映しない場合はoperator_notesに理由を書いてください。"
         "Pass If Fixedは後続reviewが確認する条件なので、plan側では満たすための具体的な変更を入れてください。"
+        "review_contextまたはrunbookにadditional-runbook-sourceがある場合、"
+        "Real-Machine Runbook Contractを最優先の制約として扱ってください。"
+        "Real-Machine Investigable Pointsだけを実機runbookのRead-only ChecksとExecution Stepsへ展開してください。"
+        "Knowledge Research Pointsは実機runbookの実行手順に入れず、Knowledge Queriesにも入れないでください。"
+        "追加runbookではKnowledge/運用文書検索は別依頼として扱われるため、knowledge_queriesは空またはnoneにしてください。"
+        "Human Decision PointsはExecution Steps、Read-only Checks、Knowledge Queriesへ入れず、Human Approval ReasonsまたはOperator Notesに分離してください。"
+        "実機runbookで何を実行するかが一目で分かるよう、Execution Stepsは具体的なread-onlyコマンドまたは確認対象だけにしてください。"
+        "module load、which after load、ビルド、ジョブ投入、ユーザーデータ参照をExecution StepsやRead-only Checksに入れてはいけません。"
         "answer_draft_skeletonには、確認済みでないmodule load、MPI実装名、configure/build option、"
         "管理者作業依頼、自前ビルド推奨を含めないでください。"
         "ユーザー向け回答案は、findings登録後に埋めるプレースホルダー形式に留めてください。"
@@ -1057,6 +1138,137 @@ def generate_runbook_chief_review(
             last_err = e
             continue
     raise RuntimeError(f"全runbook chief評価モデルで失敗しました: {last_err}")
+
+
+def generate_runbook_answer_synthesis(
+    run: Dict[str, Any],
+    documents: list[Dict[str, Any]],
+    *,
+    model: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Runbook実行結果から、Zendeskへ戻すための回答案と品質メモを作る。"""
+    system = (
+        SUPPORT_CONTEXT
+        + " "
+        "あなたはHPC/研究計算サポートの回答合成AIです。"
+        "入力は、runbook plan、risk/technical/chief review、実機実行後のfindings、issue_on_run、summary、"
+        "および既存のanswer_draftです。"
+        "目的は、浅い・一般論の回答案を、確認済み事実に基づくZendesk向け回答案へ作り直すことです。"
+        "ただし公開返信は行わず、人間レビュー用のdraftだけを作ります。"
+        "確認済みでないmodule名、MPI実装、CUDA-aware対応、ビルド可否、サポート方針、自前ビルド推奨を断定しないでください。"
+        "findingsにある事実、issue_on_runにある未確認事項、summaryの結論だけを根拠にしてください。"
+        "実機で実行していないmodule load、ビルド、ジョブ投入、ユーザーデータ参照を確認済みのように書かないでください。"
+        "回答案には、何を確認したか、何が分かったか、何が未確認か、次に何をする/ユーザーに何を依頼するかを分けて書いてください。"
+        "情報が足りず回答できない場合は、safe_to_send=false、quality=needs_more_findings、"
+        "missing_evidenceとfollowup_scopeに追加runbookで確認すべきことを書いてください。"
+        "既存draftが薄い場合はquality=superficialとし、review_notesに何が薄いかを書いたうえで、改善draftをanswer_draftに入れてください。"
+        "必ず指定JSONスキーマだけを返してください。"
+    )
+    payload = {
+        "run": {
+            "id": run.get("id"),
+            "ticket_id": run.get("ticket_id"),
+            "environment": run.get("environment"),
+            "machine": run.get("machine"),
+            "status": run.get("status"),
+            "summary": run.get("summary"),
+            "issue_on_run": run.get("issue_on_run"),
+        },
+        "documents": _compact_run_documents(documents),
+    }
+    user = (
+        "# Answer synthesis input\n"
+        f"{json.dumps(payload, ensure_ascii=False, indent=2)}\n\n"
+        "実行結果と既存draftを査読し、Zendeskへ戻すための根拠付き回答案を作成してください。"
+    )
+    candidates = runbook_model_candidates(model)
+    last_err: Optional[Exception] = None
+    for m in candidates:
+        try:
+            result = chat_json(
+                system,
+                user,
+                RUNBOOK_ANSWER_SYNTHESIS_SCHEMA,
+                model=m,
+                schema_name="runbook_answer_synthesis",
+                temperature=0.0,
+                max_tokens=4096,
+            )
+            result["_model"] = m
+            return result
+        except Exception as e:  # noqa: BLE001
+            last_err = e
+            continue
+    raise RuntimeError(f"全runbook answer synthesisモデルで失敗しました: {last_err}")
+
+
+def evaluate_answer_against_question(
+    ticket_context: Dict[str, Any],
+    run: Dict[str, Any],
+    documents: list[Dict[str, Any]],
+    *,
+    model: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Synthesized answer が元のZendesk質問に答えているか評価する。"""
+    system = (
+        SUPPORT_CONTEXT
+        + " "
+        "あなたはHPC/研究計算サポートの回答カバレッジ評価AIです。"
+        "元のZendeskチケット本文・公開コメント、Knowledge run、実行結果、最新answer_draftを読み、"
+        "そのanswer_draftがユーザーの質問に実質的に答えているかを評価してください。"
+        "あなたは回答案を書き直す担当ではなく、人間レビュアーのための評価を作る担当です。"
+        "質問の中心に答えているか、未回答の論点が残っていないか、findingsに根拠がない断定がないか、"
+        "実機で確認していない内容を確認済みのように書いていないかを見ます。"
+        "文体の好みや細かい言い回しだけで revise にしないでください。"
+        "元質問に答えるには追加調査が必要なら recommended_operator_action=request_additional_runbook にしてください。"
+        "その場合、不足を三種類に厳密に分離してください。"
+        "real_machine_investigable_pointsには、実機上でread-onlyコマンドにより確認できる事項だけを書いてください。"
+        "例: module avail/show/spider/keywordで見えるmodule metadata、PATH設定、提供module候補。"
+        "module load、which after load、ビルド、ジョブ投入、ユーザーデータ参照はread-only扱いにしないでください。"
+        "knowledge_research_pointsには、Knowledge/既存文書/運用文書の検索で確認すべき事項を書いてください。"
+        "例: 公式推奨構成、互換性表、自前ビルド方針、サポート範囲。"
+        "human_decision_pointsには、文書に明記がなく、人間が方針決定しないと決まらない事項を書いてください。"
+        "runbook_investigable_pointsは後方互換の要約として、real_machine_investigable_pointsだけを入れてください。"
+        "additional_runbook_scopeには、実機read-only runbookで自動的に調べられる範囲だけを書いてください。"
+        "運用判断やサポート方針の判断が必要なら hold_for_human_decision にしてください。"
+        "必ず指定JSONスキーマだけを返してください。"
+    )
+    payload = {
+        "ticket_context": ticket_context,
+        "run": {
+            "id": run.get("id"),
+            "ticket_id": run.get("ticket_id"),
+            "environment": run.get("environment"),
+            "machine": run.get("machine"),
+            "status": run.get("status"),
+            "summary": run.get("summary"),
+        },
+        "documents": _compact_run_documents(documents),
+    }
+    user = (
+        "# Answer evaluation input\n"
+        f"{json.dumps(payload, ensure_ascii=False, indent=2)}\n\n"
+        "最新answer_draftが元の質問に答えているか、人間レビューに役立つ評価JSONを返してください。"
+    )
+    candidates = runbook_model_candidates(model)
+    last_err: Optional[Exception] = None
+    for m in candidates:
+        try:
+            result = chat_json(
+                system,
+                user,
+                ANSWER_QUESTION_EVALUATION_SCHEMA,
+                model=m,
+                schema_name="answer_question_evaluation",
+                temperature=0.0,
+                max_tokens=4096,
+            )
+            result["_model"] = m
+            return result
+        except Exception as e:  # noqa: BLE001
+            last_err = e
+            continue
+    raise RuntimeError(f"全answer evaluationモデルで失敗しました: {last_err}")
 
 
 if __name__ == "__main__":
