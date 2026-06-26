@@ -54,6 +54,8 @@ Documents are stored in `/data/db.sqlite`. Markdown bodies, document summaries, 
 
 Plaintext body search is intentionally disabled. `/api/search` searches only non-body metadata such as title, kind, source, environment, machine, and tags.
 
+Timestamps are stored as Unix epoch seconds in SQLite. The web UI renders them with the service container's local timezone. Set `KNOWLEDGE_API_TZ` when starting compose, for example `KNOWLEDGE_API_TZ=Asia/Tokyo` on a Japan-based server or `KNOWLEDGE_API_TZ=America/New_York` on a US East server. If unset, compose defaults to `UTC`.
+
 Production Docker uses:
 
 ```text
@@ -288,6 +290,10 @@ Execution result fields:
 | `answer_draft` | Draft text for Zendesk or an internal note; keep `answer_draft_policy=hold` unless it is ready for review |
 
 Recommended status after registration is `operator_review` when a human should review the findings or answer draft. Use `closed` only when the run is complete and no follow-up action remains. Creating a `zendesk-draft` handoff queues a draft for later review; it still does not post to Zendesk.
+
+`answer_draft` registered by a real-machine gateway is an execution result draft, not necessarily the final reply candidate. The support-side `answer-synthesis-worker` can attach an `answer-quality-review` document and a newer `answer_draft` with role `answer_draft_synthesized`; operator review should prefer that synthesized draft when present, while still checking it against `findings` and `issue_on_run`.
+
+The same worker can also attach `answer-question-evaluation`, which compares the latest answer draft with the original Zendesk question and highlights covered points, unanswered points, unsupported claims, overstatements, and the recommended operator action.
 
 ## Narrow Gateway Surface
 
