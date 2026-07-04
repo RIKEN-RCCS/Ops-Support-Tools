@@ -50,6 +50,10 @@ def main() -> None:
     claim.add_argument("--ticket-id", default="")
     claim.add_argument("--environment", default="")
     claim.add_argument("--machine", default="")
+    claim.add_argument("--parent-run-id", default="")
+    claim.add_argument("--task-type", default="")
+    claim.add_argument("--executor-mode", default="")
+    claim.add_argument("--capability", default="")
     claim.add_argument("--summary-contains", default="", help="legacy plaintext summary filter")
     claim.add_argument("--document-kind", default="", help="attached document kind, e.g. runbook-plan")
     claim.add_argument("--document-title-contains", default="")
@@ -65,7 +69,11 @@ def main() -> None:
     release = sub.add_parser("release", help="release an active claim")
     release.add_argument("--run-id", required=True)
     release.add_argument("--claim-token", required=True)
-    release.add_argument("--next-status", default="review_passed", choices=["review_passed", "operator_review", "closed", "execution_failed"])
+    release.add_argument(
+        "--next-status",
+        default="review_passed",
+        choices=["review_passed", "result_registered", "answer_review", "task_done", "closed", "execution_failed"],
+    )
 
     args = parser.parse_args()
     if args.command == "claim":
@@ -76,6 +84,10 @@ def main() -> None:
             "ticket_id": args.ticket_id,
             "environment": args.environment,
             "machine": args.machine,
+            "parent_run_id": args.parent_run_id,
+            "task_type": args.task_type,
+            "executor_mode": args.executor_mode,
+            "capability": args.capability,
             "summary_contains": args.summary_contains,
             "document_kind": args.document_kind,
             "document_title_contains": args.document_title_contains,

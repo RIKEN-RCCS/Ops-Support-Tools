@@ -92,6 +92,10 @@ def cmd_claim(args: argparse.Namespace) -> None:
         "ticket_id": args.ticket_id,
         "environment": args.environment or DEFAULT_ENVIRONMENT,
         "machine": args.machine or DEFAULT_MACHINE,
+        "parent_run_id": args.parent_run_id,
+        "task_type": args.task_type,
+        "executor_mode": args.executor_mode,
+        "capability": args.capability,
         "document_kind": args.document_kind,
         "document_title_contains": args.document_title_contains,
         "document_source": args.document_source,
@@ -146,6 +150,21 @@ def cmd_submit(args: argparse.Namespace) -> None:
         "claim_token": args.claim_token,
         "runbook_document_id": args.runbook_document_id,
         "runbook_title": args.runbook_title,
+        "observed_at": args.observed_at,
+        "node": args.node,
+        "os_version": args.os_version,
+        "driver_version": args.driver_version,
+        "cuda_version": args.cuda_version,
+        "compiler_version": args.compiler_version,
+        "mpi_version": args.mpi_version,
+        "modules": args.modules,
+        "commands": args.commands,
+        "workdir": args.workdir,
+        "job_conditions": args.job_conditions,
+        "reproducibility": args.reproducibility,
+        "reuse_scope": args.reuse_scope,
+        "stale_after": args.stale_after,
+        "staleness_triggers": args.staleness_triggers,
         "findings": _read_optional_text(args.findings, args.findings_file),
         "issue_on_run": _read_optional_text(args.issue_on_run, args.issue_on_run_file),
         "summary": _read_optional_text(args.summary, args.summary_file),
@@ -182,6 +201,10 @@ def build_parser() -> argparse.ArgumentParser:
     claim.add_argument("--ticket-id", default="")
     claim.add_argument("--environment", default="")
     claim.add_argument("--machine", default="")
+    claim.add_argument("--parent-run-id", default="")
+    claim.add_argument("--task-type", default="")
+    claim.add_argument("--executor-mode", default="")
+    claim.add_argument("--capability", default="")
     claim.add_argument("--document-kind", default="runbook-plan")
     claim.add_argument("--document-title-contains", default="")
     claim.add_argument("--document-source", default="")
@@ -204,7 +227,11 @@ def build_parser() -> argparse.ArgumentParser:
     release = sub.add_parser("release")
     release.add_argument("--run-id", required=True)
     release.add_argument("--claim-token", required=True)
-    release.add_argument("--next-status", default="review_passed", choices=["review_passed", "operator_review", "closed", "execution_failed"])
+    release.add_argument(
+        "--next-status",
+        default="review_passed",
+        choices=["review_passed", "result_registered", "answer_review", "task_done", "closed", "execution_failed"],
+    )
     release.set_defaults(func=cmd_release)
 
     submit = sub.add_parser("submit")
@@ -213,6 +240,21 @@ def build_parser() -> argparse.ArgumentParser:
     submit.add_argument("--source", default="runbook-gateway")
     submit.add_argument("--runbook-document-id", default="")
     submit.add_argument("--runbook-title", default="")
+    submit.add_argument("--observed-at", default="")
+    submit.add_argument("--node", default="")
+    submit.add_argument("--os-version", default="")
+    submit.add_argument("--driver-version", default="")
+    submit.add_argument("--cuda-version", default="")
+    submit.add_argument("--compiler-version", default="")
+    submit.add_argument("--mpi-version", default="")
+    submit.add_argument("--modules", default="")
+    submit.add_argument("--commands", default="")
+    submit.add_argument("--workdir", default="")
+    submit.add_argument("--job-conditions", default="")
+    submit.add_argument("--reproducibility", default="unknown", choices=["unknown", "single_observation", "reproduced", "documented_policy", "historical"])
+    submit.add_argument("--reuse-scope", default="")
+    submit.add_argument("--stale-after", default="")
+    submit.add_argument("--staleness-triggers", default="")
     submit.add_argument("--findings", default="")
     submit.add_argument("--findings-file", default="")
     submit.add_argument("--issue-on-run", default="")
@@ -222,7 +264,19 @@ def build_parser() -> argparse.ArgumentParser:
     submit.add_argument("--answer-draft", default="")
     submit.add_argument("--answer-draft-file", default="")
     submit.add_argument("--answer-draft-policy", default="hold", choices=["hold", "internal_note", "public_reply_draft"])
-    submit.add_argument("--next-status", default="operator_review", choices=["operator_review", "review_passed", "closed", "execution_failed", "no_change"])
+    submit.add_argument(
+        "--next-status",
+        default="result_registered",
+        choices=[
+            "result_registered",
+            "answer_review",
+            "review_passed",
+            "task_done",
+            "closed",
+            "execution_failed",
+            "no_change",
+        ],
+    )
     submit.add_argument("--create-zendesk-handoff", action="store_true")
     submit.set_defaults(func=cmd_submit)
     return parser

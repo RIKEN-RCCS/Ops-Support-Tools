@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import re
 import time
 from typing import Any
 
@@ -20,7 +19,6 @@ import llm_client
 
 RUNBOOK_WORKER_ENABLED = os.environ.get("SUPPORT_AI_RUNBOOK_WORKER_ENABLED", "1").lower() in ("1", "true", "yes")
 RUNBOOK_MAX_REVISIONS = int(os.environ.get("SUPPORT_AI_RUNBOOK_MAX_REVISIONS", "2"))
-ADDITIONAL_RUNBOOK_SCHEMA_VERSION = "additional-runbook-request-v2"
 
 
 GUARD_APPROVAL_REASONS = {
@@ -40,115 +38,6 @@ def _append_unique(values: list[Any], item: str) -> list[str]:
     if item not in normalized:
         normalized.append(item)
     return normalized
-
-
-def _is_v2_additional_runbook(source_run: dict[str, Any]) -> bool:
-    body = str(source_run.get("runbook") or "")
-    return f"- schema: {ADDITIONAL_RUNBOOK_SCHEMA_VERSION}" in body
-
-
-def _section_lines(markdown: str, section: str) -> list[str]:
-    match = re.search(rf"^## {re.escape(section)}\s*$", markdown, flags=re.MULTILINE)
-    if not match:
-        return []
-    rest = markdown[match.end():]
-    next_section = re.search(r"^##\s+", rest, flags=re.MULTILINE)
-    block = rest[: next_section.start()] if next_section else rest
-    lines: list[str] = []
-    for raw in block.splitlines():
-        line = raw.strip()
-        if line.startswith("- "):
-            lines.append(line[2:].strip())
-    return [line for line in lines if line and line.lower() != "none"]
-
-
-def _looks_forbidden_for_real_machine_step(value: Any) -> bool:
-    text = str(value or "").lower()
-    forbidden = (
-        "knowledge",
-        "knowledge api",
-        "knowledge/",
-        "検索",
-        "運用文書",
-        "公式ドキュメント",
-        "policy",
-        "方針",
-        "module load",
-        "which ",
-        "ビルド",
-        "build",
-        "configure",
-        "make ",
-        "cmake",
-        "ジョブ",
-        "job",
-        "sbatch",
-        "ユーザーデータ",
-        "user data",
-    )
-    return any(term in text for term in forbidden)
-
-
-def _read_only_commands_from_points(points: list[str]) -> list[str]:
-    commands: list[str] = []
-    known_commands = (
-        "module avail compiler",
-        "module avail gcc",
-        "module avail nvhpc",
-        "module show nvhpc-hpcx/26.3",
-        "module show nvhpc-hpcx-cuda13/26.3",
-    )
-    joined = "\n".join(points).lower()
-    for command in known_commands:
-        if command.lower() in joined:
-            commands.append(command)
-    return commands
-
-
-def _sanitize_v2_additional_plan(plan: dict[str, Any], *, source_run: dict[str, Any]) -> dict[str, Any]:
-    if not _is_v2_additional_runbook(source_run):
-        return plan
-
-    guarded = dict(plan)
-    source_body = str(source_run.get("runbook") or "")
-    source_points = _section_lines(source_body, "Real-Machine Investigable Points")
-    source_commands = _read_only_commands_from_points(source_points)
-
-    read_only_checks = [
-        str(item).strip()
-        for item in guarded.get("read_only_checks") or []
-        if str(item).strip() and not _looks_forbidden_for_real_machine_step(item)
-    ]
-    for command in source_commands:
-        read_only_checks = _append_unique(read_only_checks, command)
-    if not read_only_checks:
-        read_only_checks = source_points
-
-    execution_steps = [f"Run `{item}` and record the full output." for item in read_only_checks]
-
-    guarded["knowledge_queries"] = []
-    guarded["read_only_checks"] = read_only_checks
-    guarded["execution_steps"] = execution_steps
-    guarded["requires_human_approval"] = False
-    guarded["answer_draft_policy"] = "hold"
-    guarded["approval_reasons"] = []
-    guarded["risk_review"] = _append_unique(
-        list(guarded.get("risk_review") or []),
-        "v2追加runbookのため、実機手順はReal-Machine Investigable Points由来の読み取り確認だけに制限する。",
-    )
-    guarded["stop_conditions"] = [
-        "実機でのread-only commandが失敗した場合は、エラーメッセージを記録して停止する。",
-        "module load、which after load、ビルド、ジョブ投入、ユーザーデータ参照、Knowledge/運用文書検索が必要になったら、このrunbookでは実行せずissue_on_runに分離して停止する。",
-    ]
-    guarded["answer_draft_skeleton"] = (
-        "この段階では公開返信案を確定しない。Real-Machine Investigable Points由来のread-only確認で"
-        "分かった事実だけをfindings/summaryへ登録し、Knowledge/運用方針は未確認として分離する。"
-    )
-    guarded["operator_notes"] = (
-        "Worker guard applied: v2 additional runbook was sanitized to real-machine read-only checks only; "
-        "Knowledge research and human policy decisions are tracked on the parent run, not executed here."
-    )
-    return guarded
 
 
 def _guard_plan(plan: dict[str, Any], *, source_run: dict[str, Any]) -> dict[str, Any]:
@@ -176,7 +65,7 @@ def _guard_plan(plan: dict[str, Any], *, source_run: dict[str, Any]) -> dict[str
     if guarded.get("requires_human_approval"):
         risk_review = _append_unique(
             risk_review,
-            "このplanは実行前レビュー用であり、module load、ビルド、インストール、設定変更、ジョブ投入、ユーザーデータ参照を承認しない。",
+            "このplanは実行前レビュー用であり、module load、ビルド、インストール、設定変更、ジョブ投入、ユーザーデータ参照を承認済みとはみなさない。実行前にexecutor_modeとrequired_capabilitiesに合う承認・隔離・停止条件を確認する。",
         )
 
     if guarded.get("answer_draft_policy") == "hold":
@@ -185,11 +74,58 @@ def _guard_plan(plan: dict[str, Any], *, source_run: dict[str, Any]) -> dict[str
             "確認済みの環境名、提供モジュール、サポート方針、検証結果だけを根拠として回答案を作成する。"
         )
 
-    guarded = _sanitize_v2_additional_plan(guarded, source_run=source_run)
-    approval_reasons = list(guarded.get("approval_reasons") or [])
-    risk_review = list(guarded.get("risk_review") or [])
-    stop_conditions = list(guarded.get("stop_conditions") or [])
+    allowed_caps = {"read_only", "workspace_write", "compile", "job_submit", "user_data_access", "privileged"}
+    proposed_caps = {
+        str(cap).strip()
+        for cap in guarded.get("proposed_required_capabilities") or []
+        if str(cap).strip() in allowed_caps
+    }
+    if not proposed_caps:
+        proposed_caps = {"read_only"}
+    executor_mode = str(guarded.get("proposed_executor_mode") or "").strip()
+    if executor_mode not in {"auto_agent_allowed", "human_with_ai", "human_only"}:
+        executor_mode = "auto_agent_allowed"
+    proposed_risk = str(guarded.get("proposed_risk_level") or "").strip()
+    if proposed_risk not in {"low", "medium", "high", "blocked"}:
+        proposed_risk = "low"
 
+    risky_caps = {"workspace_write", "compile", "job_submit", "user_data_access", "privileged"}
+    if source_run.get("task_type") == "real_machine" and proposed_caps & risky_caps:
+        executor_mode = "human_with_ai" if executor_mode == "auto_agent_allowed" else executor_mode
+        if proposed_risk == "low":
+            proposed_risk = "medium"
+        guarded["requires_human_approval"] = True
+        guarded["answer_draft_policy"] = "hold"
+        approval_reasons = _append_unique(
+            approval_reasons,
+            "required_capabilities に read-only を超える操作が含まれるため、実行者のcapability、作業場所、承認、停止条件を確認してから実行する。",
+        )
+        risk_review = _append_unique(
+            risk_review,
+            "read-only専用AIはこのrunbookをclaimしてはいけない。compile/job_submit等に対応した人間またはhuman_with_ai実行者だけが扱う。",
+        )
+        if "workspace_write" in proposed_caps or "compile" in proposed_caps:
+            stop_conditions = _append_unique(
+                stop_conditions,
+                "書き込みやビルドは専用一時ディレクトリまたは隔離された作業領域でのみ行い、ユーザーデータを参照・変更しない。",
+            )
+        if "job_submit" in proposed_caps:
+            stop_conditions = _append_unique(
+                stop_conditions,
+                "ジョブ投入は短時間・最小資源・テスト専用キュー/設定に限定できない場合は実行せずissue_on_runへ記録する。",
+            )
+        if proposed_caps & {"user_data_access", "privileged"}:
+            executor_mode = "human_only"
+            proposed_risk = "high" if proposed_risk in {"low", "medium"} else proposed_risk
+            stop_conditions = _append_unique(
+                stop_conditions,
+                "ユーザーデータ参照または特権操作が必要になった場合は自動実行せず、人間の明示承認と操作範囲確認まで停止する。",
+            )
+        guard_notes.append("risk_capability_classification")
+
+    guarded["proposed_required_capabilities"] = sorted(proposed_caps)
+    guarded["proposed_executor_mode"] = executor_mode
+    guarded["proposed_risk_level"] = proposed_risk
     guarded["approval_reasons"] = approval_reasons
     guarded["risk_review"] = risk_review
     guarded["stop_conditions"] = stop_conditions
@@ -210,6 +146,9 @@ def _plan_document_body(plan: dict[str, Any], *, source_run: dict[str, Any]) -> 
         f"- environment: {source_run.get('environment') or ''}\n"
         f"- machine: {source_run.get('machine') or ''}\n"
         f"- answer_draft_policy: {plan.get('answer_draft_policy')}\n"
+        f"- proposed_required_capabilities: {', '.join(plan.get('proposed_required_capabilities') or []) or 'none'}\n"
+        f"- proposed_executor_mode: {plan.get('proposed_executor_mode') or ''}\n"
+        f"- proposed_risk_level: {plan.get('proposed_risk_level') or ''}\n"
         f"- requires_human_approval: {'yes' if plan.get('requires_human_approval') else 'no'}\n\n"
         "## Worker Guard\n"
         f"- target_environment_known: {'yes' if str(source_run.get('environment') or '').strip() else 'no'}\n"
@@ -268,6 +207,15 @@ def _attach_plan(run: dict[str, Any], plan: dict[str, Any]) -> str:
     return str(document.get("id") or "")
 
 
+def _apply_plan_execution_metadata(run_id: str, plan: dict[str, Any]) -> None:
+    common.knowledge_update_run(run_id, {
+        "required_capabilities": plan.get("proposed_required_capabilities") or ["read_only"],
+        "executor_mode": str(plan.get("proposed_executor_mode") or "auto_agent_allowed"),
+        "risk_level": str(plan.get("proposed_risk_level") or "low"),
+        "approval_required": bool(plan.get("requires_human_approval")),
+    })
+
+
 def _revision_count(documents: list[dict[str, Any]]) -> int:
     return sum(1 for doc in documents if doc.get("kind") == "runbook-revision-request")
 
@@ -305,11 +253,75 @@ def _review_context(documents: list[dict[str, Any]]) -> str:
     return "\n\n".join(parts)
 
 
+def _parent_case_context(run: dict[str, Any]) -> str:
+    parent_run_id = str(run.get("parent_run_id") or "")
+    if not parent_run_id:
+        return ""
+    try:
+        parent = common.knowledge_get_run(parent_run_id)
+        parent_docs = common.knowledge_list_run_documents(parent_run_id, include_body=True)
+        siblings = common.knowledge_list_runs(parent_run_id=parent_run_id, limit=50)
+    except Exception as exc:  # noqa: BLE001
+        return f"parent case context unavailable: {exc}"
+
+    important_kinds = {
+        "investigation-router-plan",
+        "knowledge-research-request",
+        "knowledge-research-result",
+        "policy-decision-request",
+        "real-machine-scope-request",
+        "real-machine-task-split-plan",
+        "real-machine-investigation-request",
+        "answer-question-evaluation",
+    }
+    parts = [
+        "# Parent Investigation Case",
+        f"- id: {parent.get('id')}",
+        f"- status: {parent.get('status')}",
+        f"- summary: {parent.get('summary')}",
+        "",
+        "## Sibling Tasks",
+    ]
+    for sibling in siblings:
+        parts.append(
+            f"- {sibling.get('id')} type={sibling.get('task_type') or 'case'} "
+            f"status={sibling.get('status')} summary={sibling.get('summary')}"
+        )
+    parts.append("")
+    parts.append("## Parent/Task Evidence Documents")
+    for doc in parent_docs[-12:]:
+        if doc.get("kind") not in important_kinds:
+            continue
+        parts.append(
+            f"### {doc.get('kind')} / {doc.get('title')}\n"
+            f"summary: {doc.get('summary')}\n"
+            f"{str(doc.get('body_md') or '')[:5000]}"
+        )
+    for sibling in siblings:
+        if sibling.get("id") == run.get("id"):
+            continue
+        try:
+            sibling_docs = common.knowledge_list_run_documents(str(sibling["id"]), include_body=True)
+        except Exception:
+            sibling_docs = []
+        for doc in sibling_docs[-6:]:
+            if doc.get("kind") not in important_kinds:
+                continue
+            parts.append(
+                f"### sibling {sibling.get('task_type')} {sibling.get('id')} "
+                f"{doc.get('kind')} / {doc.get('title')}\n"
+                f"task_status: {sibling.get('status')}\n"
+                f"summary: {doc.get('summary')}\n"
+                f"{str(doc.get('body_md') or '')[:5000]}"
+            )
+    return "\n\n".join(parts)[:24000]
+
+
 def process_one(run_ref: dict[str, Any], *, verbose: bool = False) -> bool:
     run_id = str(run_ref["id"])
     try:
         run = common.knowledge_get_run(run_id)
-        if run.get("status") not in {"requested", "revision_requested"}:
+        if run.get("status") not in {"requested", "revision_requested", "planning"}:
             if verbose:
                 common.log(f"runbook skip {run_id}: status={run.get('status')}")
             return False
@@ -317,17 +329,19 @@ def process_one(run_ref: dict[str, Any], *, verbose: bool = False) -> bool:
         revision_no = _revision_count(documents)
         if run.get("status") == "revision_requested" and revision_no > RUNBOOK_MAX_REVISIONS:
             common.knowledge_update_run(run_id, {
-                "status": "operator_review",
+                "status": "human_review",
                 "issue_on_run": f"runbook revision limit exceeded: {revision_no}>{RUNBOOK_MAX_REVISIONS}",
             })
             return False
         run["_documents"] = documents
         run["review_context"] = _review_context(documents)
+        run["parent_case_context"] = _parent_case_context(run)
         common.knowledge_update_run(run_id, {"status": "planning"})
         if verbose:
             common.log(f"runbook planning {run_id}")
         plan = _guard_plan(llm_client.generate_runbook_plan(run), source_run=run)
         doc_id = _attach_plan(run, plan)
+        _apply_plan_execution_metadata(run_id, plan)
         summary = (
             f"Runbook plan generated by {plan.get('_model', 'unknown')}. "
             f"Answer policy: {plan.get('answer_draft_policy')}."
@@ -344,7 +358,7 @@ def process_one(run_ref: dict[str, Any], *, verbose: bool = False) -> bool:
         common.log(f"runbook worker failed {run_id}: {exc}")
         try:
             common.knowledge_update_run(run_id, {
-                "status": "operator_review",
+                "status": "human_review",
                 "issue_on_run": f"runbook worker failed: {exc}",
             })
         except Exception as update_exc:  # noqa: BLE001
@@ -361,10 +375,17 @@ def run_once(verbose: bool = False, limit: int = 5) -> int:
         if verbose:
             common.log("runbook worker skipped: Knowledge API not configured")
         return 0
-    runs = common.knowledge_list_runs(status="requested", limit=limit)
-    remaining = max(0, limit - len(runs))
-    if remaining:
-        runs.extend(common.knowledge_list_runs(status="revision_requested", limit=remaining))
+    runs = []
+    for _ in range(limit):
+        run = common.knowledge_worker_claim_run(
+            worker="runbook-worker",
+            statuses=["requested", "revision_requested"],
+            claim_status="planning",
+            task_type="real_machine",
+        )
+        if not run:
+            break
+        runs.append(run)
     n = 0
     for run in runs:
         if process_one(run, verbose=verbose):
