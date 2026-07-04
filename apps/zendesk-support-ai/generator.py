@@ -53,7 +53,7 @@ def _yesno(value: object) -> str:
 def _build_runbook(triage: dict) -> str:
     """環境依存の問い合わせを後続AI/人間へ渡すための初期runbook。"""
     return (
-        "# Runbook Request\n\n"
+        "# Investigation Case Request\n\n"
         "## Goal\n"
         "チケット内容に対して、公開返信前に必要な環境固有情報・既存知見・実機状態を確認し、"
         "根拠付きの回答案を作成する。\n\n"
@@ -84,7 +84,7 @@ def _build_runbook(triage: dict) -> str:
         "- `answer_draft`: Zendeskへ戻す社内メモ案または公開返信案。公開可否を明記する。\n\n"
         "## Failed-Run Loop\n"
         "この run で解決できない場合は、`summary` に不足情報と次に必要な確認を明記し、"
-        "追加runbook生成または `operator-review` handoff に回す。\n\n"
+        "追加investigation task生成または `operator-review` handoff に回す。\n\n"
         "## Initial AI Triage\n"
         f"- summary: {triage.get('summary', '').strip()}\n"
         f"- probable_cause: {triage.get('probable_cause', '').strip()}\n"
@@ -99,21 +99,21 @@ def _build_runbook(triage: dict) -> str:
 def _decision_document_body(
     *,
     decision: str,
-    runbook_change: str,
+    case_change: str,
     triage: dict,
     reason: str = "",
-    runbook_delta: str = "",
+    case_delta: str = "",
     answer_draft_policy: str = "",
 ) -> str:
     return (
-        "# Runbook Decision\n\n"
+        "# Investigation Case/Task Decision\n\n"
         f"- investigation_decision: {decision}\n"
-        f"- runbook_change: {runbook_change}\n"
+        f"- case_change: {case_change}\n"
         f"- answer_draft_policy: {answer_draft_policy or ('draft' if triage.get('safe_to_reply_to_user') else 'hold')}\n\n"
         "## Reason\n"
-        f"{reason or '同じ Zendesk ticket の未完了 run に対する runbook decision。'}\n\n"
-        "## Runbook Delta\n"
-        f"{runbook_delta or 'none'}\n\n"
+        f"{reason or '同じ Zendesk ticket の未完了 investigation case に対する case/task decision。'}\n\n"
+        "## Investigation Delta\n"
+        f"{case_delta or 'none'}\n\n"
         "## Added Context\n"
         f"- summary: {triage.get('summary', '').strip()}\n"
         f"- probable_cause: {triage.get('probable_cause', '').strip()}\n"
@@ -132,39 +132,39 @@ def _attach_decision_document(
     decision: dict,
 ) -> None:
     investigation_decision = str(decision.get("investigation_decision") or "attach_to_existing_run")
-    runbook_change = str(decision.get("runbook_change") or "append_context")
+    case_change = str(decision.get("case_change") or "append_context")
     common.knowledge_attach_run_document(run_id, {
-        "role": "runbook_decision",
+        "role": "case_decision",
         "ticket_id": ticket_id,
-        "kind": "runbook-decision",
-        "title": f"Runbook decision for ticket {ticket_id}",
-        "summary": f"{investigation_decision}; runbook_change={runbook_change}.",
+        "kind": "case-decision",
+        "title": f"Investigation case/task decision for ticket {ticket_id}",
+        "summary": f"{investigation_decision}; case_change={case_change}.",
         "body_md": _decision_document_body(
             decision=investigation_decision,
-            runbook_change=runbook_change,
+            case_change=case_change,
             triage=triage,
             reason=str(decision.get("reason") or ""),
-            runbook_delta=str(decision.get("runbook_delta") or ""),
+            case_delta=str(decision.get("case_delta") or ""),
             answer_draft_policy=str(decision.get("answer_draft_policy") or ""),
         ),
-        "tags": ["runbook-decision", "triage", str(triage.get("category") or "other")],
+        "tags": ["case-decision", "triage", str(triage.get("category") or "other")],
         "source": "zendesk-support-ai",
     })
 
 
 def _runbook_with_decision_delta(triage: dict, decision: dict) -> str:
     runbook = _build_runbook(triage)
-    delta = str(decision.get("runbook_delta") or "").strip()
+    delta = str(decision.get("case_delta") or "").strip()
     reason = str(decision.get("reason") or "").strip()
     if not delta and not reason:
         return runbook
     return (
         f"{runbook}\n\n"
-        "## Runbook Decision Delta\n"
+        "## Investigation Decision Delta\n"
         f"- investigation_decision: {decision.get('investigation_decision')}\n"
-        f"- runbook_change: {decision.get('runbook_change')}\n"
+        f"- case_change: {decision.get('case_change')}\n"
         f"- reason: {reason or 'none'}\n"
-        f"- runbook_delta: {delta or 'none'}\n"
+        f"- case_delta: {delta or 'none'}\n"
     )
 
 
@@ -208,47 +208,50 @@ def _create_knowledge_run(ticket_id: int, triage: dict, *, environment: str = ""
         "ticket_id": ticket_id,
         "environment": environment,
         "machine": machine,
-        "status": "requested",
+        "task_type": "investigation_case",
+        "task_priority": "normal",
+        "status": "routing_requested",
         "runbook": _build_runbook(triage),
         "summary": triage.get("summary", ""),
     }
     try:
-        created_runbook_change = "initial"
+        created_case_change = "initial"
         existing = common.knowledge_find_requested_run(ticket_id)
         if existing and existing.get("id"):
-            decision = llm_client.runbook_decision(
+            decision = llm_client.case_decision(
                 source="triage",
                 ticket_id=ticket_id,
                 analysis=triage,
                 existing_run=existing,
             )
-            decision = llm_client.normalize_runbook_decision(decision)
+            decision = llm_client.normalize_case_decision(decision)
             investigation_decision = str(decision.get("investigation_decision") or "operator_review")
-            runbook_change = str(decision.get("runbook_change") or "none")
+            case_change = str(decision.get("case_change") or "none")
             run_id = str(existing["id"])
             if investigation_decision == "attach_to_existing_run":
                 _attach_decision_document(ticket_id, run_id, triage, decision=decision)
-                return run_id, None, investigation_decision, runbook_change
+                common.knowledge_update_run(run_id, {"status": "routing_requested"})
+                return run_id, None, investigation_decision, case_change
             if investigation_decision == "no_runbook_needed":
                 _attach_decision_document(ticket_id, run_id, triage, decision=decision)
-                return None, None, investigation_decision, runbook_change
+                return None, None, investigation_decision, case_change
             if investigation_decision == "operator_review":
                 _attach_decision_document(ticket_id, run_id, triage, decision=decision)
-                return run_id, None, investigation_decision, runbook_change
+                return run_id, None, investigation_decision, case_change
             payload["runbook"] = _runbook_with_decision_delta(triage, decision)
-            payload["summary"] = f"{triage.get('summary', '')} ({runbook_change})"
-            created_runbook_change = runbook_change
+            payload["summary"] = f"{triage.get('summary', '')} ({case_change})"
+            created_case_change = case_change
         created = common.knowledge_create_run(payload)
         run = created.get("run") if isinstance(created, dict) else {}
         run_id = run.get("id") if isinstance(run, dict) else None
-        return str(run_id) if run_id else None, None, "open_new_investigation", created_runbook_change
+        return str(run_id) if run_id else None, None, "open_new_investigation", created_case_change
     except Exception as exc:  # noqa: BLE001
         return None, str(exc), "operator_review", "none"
 
 
 def _build_note_body(triage: dict, model: str, *, knowledge_run_id: str | None = None,
                      knowledge_run_error: str | None = None, investigation_decision: str = "",
-                     runbook_change: str = "") -> str:
+                     case_change: str = "") -> str:
     """トリアージ結果から社内メモ本文を組み立てる(プレースホルダは残したまま)。"""
     qs = triage.get("clarifying_questions") or []
     q_lines = "\n".join(f"- {q}" for q in qs) if qs else "- (なし)"
@@ -268,7 +271,7 @@ def _build_note_body(triage: dict, model: str, *, knowledge_run_id: str | None =
         run_line = (
             "\n■ Knowledge run\n"
             f"investigation_decision: {investigation_decision or 'open_new_investigation'}\n"
-            f"runbook_change: {runbook_change or 'initial'}\n"
+            f"case_change: {case_change or 'initial'}\n"
             f"run_id: {knowledge_run_id}\n"
         )
     elif knowledge_run_error:
@@ -329,7 +332,7 @@ def process_one(path, verbose: bool = False) -> bool:
         triage["machine"] = machine
         triage["target_resolution"] = target_resolution
         triage["target_resolution_reason"] = target_resolution_reason
-        knowledge_run_id, knowledge_run_error, investigation_decision, runbook_change = _create_knowledge_run(
+        knowledge_run_id, knowledge_run_error, investigation_decision, case_change = _create_knowledge_run(
             ticket_id,
             triage,
             environment=environment,
@@ -359,14 +362,14 @@ def process_one(path, verbose: bool = False) -> bool:
             "target_resolution_reason": target_resolution_reason,
             "knowledge_run_id": knowledge_run_id,
             "investigation_decision": investigation_decision,
-            "runbook_change": runbook_change,
+            "case_change": case_change,
             "note_body": _build_note_body(
                 triage,
                 model,
                 knowledge_run_id=knowledge_run_id,
                 knowledge_run_error=knowledge_run_error,
                 investigation_decision=investigation_decision,
-                runbook_change=runbook_change,
+                case_change=case_change,
             ),
             "mask_mapping": mapping,  # ローカル保持のみ。LLM にも外部にも送らない
         }

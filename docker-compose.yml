@@ -1,6 +1,7 @@
 name: ops-support-tools
 
 x-support-secret-env: &support-secret-env
+  TZ: ${OPS_SUPPORT_TOOLS_TZ:-UTC}
   SUPPORT_AI_WEBHOOK_TOKEN_FILE: /run/secrets/support_ai_webhook_token
   LLM_API_KEY_FILE: /run/secrets/llm_api_key
   ZENDESK_KEY_FILE: /run/secrets/zendesk_key
@@ -123,6 +124,54 @@ services:
     depends_on:
       - knowledge-api
 
+  investigation-router-worker:
+    build: ./apps/zendesk-support-ai
+    command: ["python", "investigation_router_worker.py", "-v", "--interval", "60"]
+    user: "10001:1000"
+    env_file:
+      - path: ./apps/zendesk-support-ai/.env
+        required: false
+    environment: *support-secret-env
+    secrets: *support-secrets
+    volumes:
+      - ./apps/zendesk-support-ai/data:/data/queue
+      - ./apps/zendesk-support-ai/config:/config
+    restart: unless-stopped
+    depends_on:
+      - knowledge-api
+
+  knowledge-research-worker:
+    build: ./apps/zendesk-support-ai
+    command: ["python", "knowledge_research_worker.py", "-v", "--interval", "60"]
+    user: "10001:1000"
+    env_file:
+      - path: ./apps/zendesk-support-ai/.env
+        required: false
+    environment: *support-secret-env
+    secrets: *support-secrets
+    volumes:
+      - ./apps/zendesk-support-ai/data:/data/queue
+      - ./apps/zendesk-support-ai/config:/config
+    restart: unless-stopped
+    depends_on:
+      - knowledge-api
+
+  real-machine-task-splitter-worker:
+    build: ./apps/zendesk-support-ai
+    command: ["python", "real_machine_task_splitter_worker.py", "-v", "--interval", "60"]
+    user: "10001:1000"
+    env_file:
+      - path: ./apps/zendesk-support-ai/.env
+        required: false
+    environment: *support-secret-env
+    secrets: *support-secrets
+    volumes:
+      - ./apps/zendesk-support-ai/data:/data/queue
+      - ./apps/zendesk-support-ai/config:/config
+    restart: unless-stopped
+    depends_on:
+      - knowledge-api
+
   answer-synthesis-worker:
     build: ./apps/zendesk-support-ai
     command: ["python", "answer_synthesis_worker.py", "-v", "--interval", "60"]
@@ -146,7 +195,7 @@ services:
       - knowledge_field_key
       - knowledge_api_write_token
     environment:
-      TZ: ${KNOWLEDGE_API_TZ:-UTC}
+      TZ: ${OPS_SUPPORT_TOOLS_TZ:-UTC}
       KNOWLEDGE_API_WRITE_TOKEN_FILE: /run/secrets/knowledge_api_write_token
     ports:
       - "127.0.0.1:18180:8080"

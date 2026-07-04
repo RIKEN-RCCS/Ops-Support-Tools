@@ -86,7 +86,7 @@ def _yesno(value: object) -> str:
 
 def _build_runbook(result: dict[str, Any]) -> str:
     return (
-        "# Followup Runbook Request\n\n"
+        "# Followup Investigation Case Request\n\n"
         "## Goal\n"
         "追加質問に対して、公開返信前に必要な環境固有情報・既存知見・実機状態を確認し、"
         "根拠付きの回答案を作成する。\n\n"
@@ -110,21 +110,21 @@ def _build_runbook(result: dict[str, Any]) -> str:
 def _decision_document_body(
     *,
     decision: str,
-    runbook_change: str,
+    case_change: str,
     result: dict[str, Any],
     reason: str = "",
-    runbook_delta: str = "",
+    case_delta: str = "",
     answer_draft_policy: str = "",
 ) -> str:
     return (
-        "# Followup Runbook Decision\n\n"
+        "# Followup Investigation Case/Task Decision\n\n"
         f"- investigation_decision: {decision}\n"
-        f"- runbook_change: {runbook_change}\n"
+        f"- case_change: {case_change}\n"
         f"- answer_draft_policy: {answer_draft_policy or ('draft' if result.get('safe_to_reply_to_user') else 'hold')}\n\n"
         "## Reason\n"
-        f"{reason or '同じ Zendesk ticket の未完了 run に対する followup runbook decision。'}\n\n"
-        "## Runbook Delta\n"
-        f"{runbook_delta or 'none'}\n\n"
+        f"{reason or '同じ Zendesk ticket の未完了 investigation case に対する followup case/task decision。'}\n\n"
+        "## Investigation Delta\n"
+        f"{case_delta or 'none'}\n\n"
         "## Added Followup Context\n"
         f"- summary: {result.get('summary', '').strip()}\n"
         f"- answer_confidence: {result.get('answer_confidence')}\n"
@@ -140,39 +140,39 @@ def _attach_decision_document(
     decision: dict[str, Any],
 ) -> None:
     investigation_decision = str(decision.get("investigation_decision") or "attach_to_existing_run")
-    runbook_change = str(decision.get("runbook_change") or "append_context")
+    case_change = str(decision.get("case_change") or "append_context")
     common.knowledge_attach_run_document(run_id, {
-        "role": "runbook_decision",
+        "role": "case_decision",
         "ticket_id": ticket_id,
-        "kind": "runbook-decision",
-        "title": f"Followup runbook decision for ticket {ticket_id}",
-        "summary": f"{investigation_decision}; runbook_change={runbook_change}.",
+        "kind": "case-decision",
+        "title": f"Followup investigation case/task decision for ticket {ticket_id}",
+        "summary": f"{investigation_decision}; case_change={case_change}.",
         "body_md": _decision_document_body(
             decision=investigation_decision,
-            runbook_change=runbook_change,
+            case_change=case_change,
             result=result,
             reason=str(decision.get("reason") or ""),
-            runbook_delta=str(decision.get("runbook_delta") or ""),
+            case_delta=str(decision.get("case_delta") or ""),
             answer_draft_policy=str(decision.get("answer_draft_policy") or ""),
         ),
-        "tags": ["runbook-decision", "followup"],
+        "tags": ["case-decision", "followup"],
         "source": "zendesk-support-ai",
     })
 
 
 def _runbook_with_decision_delta(result: dict[str, Any], decision: dict[str, Any]) -> str:
     runbook = _build_runbook(result)
-    delta = str(decision.get("runbook_delta") or "").strip()
+    delta = str(decision.get("case_delta") or "").strip()
     reason = str(decision.get("reason") or "").strip()
     if not delta and not reason:
         return runbook
     return (
         f"{runbook}\n\n"
-        "## Runbook Decision Delta\n"
+        "## Investigation Decision Delta\n"
         f"- investigation_decision: {decision.get('investigation_decision')}\n"
-        f"- runbook_change: {decision.get('runbook_change')}\n"
+        f"- case_change: {decision.get('case_change')}\n"
         f"- reason: {reason or 'none'}\n"
-        f"- runbook_delta: {delta or 'none'}\n"
+        f"- case_delta: {delta or 'none'}\n"
     )
 
 
@@ -183,40 +183,42 @@ def _create_knowledge_run(ticket_id: int, result: dict[str, Any]) -> tuple[str |
         return None, None, "no_runbook_needed", "none"
     payload = {
         "ticket_id": ticket_id,
-        "status": "requested",
+        "task_type": "investigation_case",
+        "task_priority": "normal",
+        "status": "routing_requested",
         "runbook": _build_runbook(result),
         "summary": result.get("summary", ""),
     }
     try:
-        created_runbook_change = "initial"
+        created_case_change = "initial"
         existing = common.knowledge_find_requested_run(ticket_id)
         if existing and existing.get("id"):
-            decision = llm_client.runbook_decision(
+            decision = llm_client.case_decision(
                 source="followup",
                 ticket_id=ticket_id,
                 analysis=result,
                 existing_run=existing,
             )
-            decision = llm_client.normalize_runbook_decision(decision)
+            decision = llm_client.normalize_case_decision(decision)
             investigation_decision = str(decision.get("investigation_decision") or "operator_review")
-            runbook_change = str(decision.get("runbook_change") or "none")
+            case_change = str(decision.get("case_change") or "none")
             run_id = str(existing["id"])
             if investigation_decision == "attach_to_existing_run":
                 _attach_decision_document(ticket_id, run_id, result, decision=decision)
-                return run_id, None, investigation_decision, runbook_change
+                return run_id, None, investigation_decision, case_change
             if investigation_decision == "no_runbook_needed":
                 _attach_decision_document(ticket_id, run_id, result, decision=decision)
-                return None, None, investigation_decision, runbook_change
+                return None, None, investigation_decision, case_change
             if investigation_decision == "operator_review":
                 _attach_decision_document(ticket_id, run_id, result, decision=decision)
-                return run_id, None, investigation_decision, runbook_change
+                return run_id, None, investigation_decision, case_change
             payload["runbook"] = _runbook_with_decision_delta(result, decision)
-            payload["summary"] = f"{result.get('summary', '')} ({runbook_change})"
-            created_runbook_change = runbook_change
+            payload["summary"] = f"{result.get('summary', '')} ({case_change})"
+            created_case_change = case_change
         created = common.knowledge_create_run(payload)
         run = created.get("run") if isinstance(created, dict) else {}
         run_id = run.get("id") if isinstance(run, dict) else None
-        return str(run_id) if run_id else None, None, "open_new_investigation", created_runbook_change
+        return str(run_id) if run_id else None, None, "open_new_investigation", created_case_change
     except Exception as exc:  # noqa: BLE001
         return None, str(exc), "operator_review", "none"
 
@@ -229,7 +231,7 @@ def _build_internal_note(
     knowledge_run_id: str | None = None,
     knowledge_run_error: str | None = None,
     investigation_decision: str = "",
-    runbook_change: str = "",
+    case_change: str = "",
 ) -> str:
     answerable = "yes" if result.get("answerable") else "no"
     review = "yes" if result.get("needs_agent_review") else "no"
@@ -250,7 +252,7 @@ def _build_internal_note(
         run_line = (
             "\n■ Knowledge run\n"
             f"investigation_decision: {investigation_decision or 'open_new_investigation'}\n"
-            f"runbook_change: {runbook_change or 'initial'}\n"
+            f"case_change: {case_change or 'initial'}\n"
             f"run_id: {knowledge_run_id}\n"
         )
     elif knowledge_run_error:
@@ -327,7 +329,7 @@ def process_one(path, verbose: bool = False) -> bool:
         result = llm_client.followup_reply(masked[0], masked[1], masked[2])
         _validate_result(result)
         model = result.get("_model", "unknown")
-        knowledge_run_id, knowledge_run_error, investigation_decision, runbook_change = _create_knowledge_run(ticket_id, result)
+        knowledge_run_id, knowledge_run_error, investigation_decision, case_change = _create_knowledge_run(ticket_id, result)
         if knowledge_run_error and verbose:
             common.log(f"followup knowledge run create failed ticket_{ticket_id}: {knowledge_run_error}")
 
@@ -338,7 +340,7 @@ def process_one(path, verbose: bool = False) -> bool:
             knowledge_run_id=knowledge_run_id,
             knowledge_run_error=knowledge_run_error,
             investigation_decision=investigation_decision,
-            runbook_change=runbook_change,
+            case_change=case_change,
         )
         if pii_mask.has_unresolved_placeholders(note, mapping):
             raise ValidationError("対応表に無いプレースホルダ(捏造)が本文に残っている")
@@ -362,7 +364,7 @@ def process_one(path, verbose: bool = False) -> bool:
             "suggested_next_action": result["suggested_next_action"],
             "knowledge_run_id": knowledge_run_id,
             "investigation_decision": investigation_decision,
-            "runbook_change": runbook_change,
+            "case_change": case_change,
             "note_body": note,
             "mask_mapping": mapping,
         }

@@ -2,7 +2,7 @@
 
 Apptainer-based CLI gateway for real-machine operators and AI agents.
 
-The gateway lets authorized local users claim reviewed runbooks, inspect the runbook documents, keep a lease alive, submit execution results, and release work. It talks only to the narrow Knowledge API handoff endpoints.
+The gateway lets authorized local users claim reviewed **real-machine runbook tasks**, inspect the runbook documents, keep a lease alive, submit execution results, and release work. It talks only to the narrow Knowledge API handoff endpoints. It is not used for parent investigation cases, DB/RAG/web research tasks, or policy-decision tasks.
 
 ## Security Model
 
@@ -49,7 +49,7 @@ install -o root -g support-ai-runbook -m 640 knowledge_write_token /etc/support-
 
 ## Commands
 
-Claim the oldest suitable `review_passed` run:
+Claim the oldest suitable `review_passed` real-machine task run:
 
 ```bash
 runbook-gateway claim
@@ -60,9 +60,13 @@ Claim by target:
 ```bash
 runbook-gateway claim \
   --machine RIKYU \
+  --task-type real_machine \
+  --capability read_only \
   --document-kind runbook-plan \
   --document-tag cuda
 ```
+
+For specialized agents or people, claim filters can narrow the queue by `--parent-run-id`, `--task-type`, `--executor-mode`, and `--capability`. This keeps read-only agents, compile-capable agents, and human-with-AI work separated while using the same Knowledge API lease mechanism.
 
 Show a claimed run and attached documents:
 
@@ -84,12 +88,21 @@ Submit execution results:
 runbook-gateway submit \
   --run-id RUN_ID \
   --claim-token CLAIM_TOKEN \
+  --node c000 \
+  --cuda-version "CUDA module/version observed" \
+  --compiler-version "GCC version observed" \
+  --mpi-version "MPI/HPC-X version observed" \
+  --reproducibility single_observation \
+  --reuse-scope "RIKYU module selection for CUDA/GCC/MPI" \
+  --staleness-triggers "driver, CUDA, GCC, MPI, module tree, or maintenance update" \
   --findings-file findings.md \
   --issue-on-run-file issue_on_run.md \
   --summary-file summary.md \
   --answer-draft-file answer_draft.md \
-  --next-status operator_review
+  --next-status result_registered
 ```
+
+Use the provenance flags whenever a result may become reusable knowledge. Reusable does not mean permanently reproducible: include the machine, node, versions, modules, commands, job conditions, and staleness triggers so later agents can decide whether to reuse the finding, refresh it on the machine, or ask a human for policy confirmation.
 
 Release without completing:
 

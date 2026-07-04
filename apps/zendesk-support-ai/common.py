@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import sqlite3
 import sys
 import tempfile
@@ -678,7 +679,14 @@ def knowledge_create_run(payload: Dict[str, Any]) -> Dict[str, Any]:
     return resp.json()
 
 
-def knowledge_list_runs(*, ticket_id: Optional[int] = None, status: str = "", limit: int = 50) -> List[Dict[str, Any]]:
+def knowledge_list_runs(
+    *,
+    ticket_id: Optional[int] = None,
+    status: str = "",
+    parent_run_id: str = "",
+    task_type: str = "",
+    limit: int = 50,
+) -> List[Dict[str, Any]]:
     """Knowledge API の run 一覧を取得する。"""
     if not KNOWLEDGE_API_URL:
         raise RuntimeError("SUPPORT_AI_KNOWLEDGE_API_URL が未設定です")
@@ -687,6 +695,10 @@ def knowledge_list_runs(*, ticket_id: Optional[int] = None, status: str = "", li
         params["ticket_id"] = int(ticket_id)
     if status:
         params["status"] = status
+    if parent_run_id:
+        params["parent_run_id"] = parent_run_id
+    if task_type:
+        params["task_type"] = task_type
     resp = requests.get(
         KNOWLEDGE_API_URL + "/api/runs",
         params=params,
@@ -698,6 +710,49 @@ def knowledge_list_runs(*, ticket_id: Optional[int] = None, status: str = "", li
     data = resp.json()
     runs = data.get("runs") if isinstance(data, dict) else []
     return runs if isinstance(runs, list) else []
+
+
+def knowledge_worker_claim_run(
+    *,
+    worker: str,
+    statuses: List[str],
+    claim_status: str,
+    ticket_id: Optional[int] = None,
+    parent_run_id: str = "",
+    task_type: str = "",
+    lease_seconds: int = 1800,
+) -> Optional[Dict[str, Any]]:
+    """Atomically claim one Knowledge run for an AI worker."""
+    if not KNOWLEDGE_API_URL:
+        raise RuntimeError("SUPPORT_AI_KNOWLEDGE_API_URL が未設定です")
+    worker_id = f"{worker}@{socket.gethostname()}"
+    payload: Dict[str, Any] = {
+        "worker": worker_id,
+        "statuses": statuses,
+        "claim_status": claim_status,
+        "lease_seconds": int(lease_seconds),
+    }
+    if ticket_id is not None:
+        payload["ticket_id"] = int(ticket_id)
+    if parent_run_id:
+        payload["parent_run_id"] = parent_run_id
+    if task_type:
+        payload["task_type"] = task_type
+    resp = requests.post(
+        KNOWLEDGE_API_URL + "/api/runs/worker-claim",
+        json=payload,
+        headers={"Content-Type": "application/json", "Accept": "application/json"},
+        timeout=HTTP_TIMEOUT,
+    )
+    if resp.status_code == 404:
+        return None
+    if not resp.ok:
+        raise RuntimeError(f"Knowledge API POST /api/runs/worker-claim -> {resp.status_code}: {resp.text[:500]}")
+    data = resp.json()
+    run = data.get("run") if isinstance(data, dict) else None
+    if not isinstance(run, dict):
+        raise RuntimeError("Knowledge API POST /api/runs/worker-claim returned no run")
+    return run
 
 
 def knowledge_find_requested_run(ticket_id: int) -> Optional[Dict[str, Any]]:
@@ -773,3 +828,38 @@ def knowledge_list_run_documents(run_id: str, *, include_body: bool = False) -> 
     data = resp.json()
     documents = data.get("documents") if isinstance(data, dict) else []
     return documents if isinstance(documents, list) else []
+
+
+def knowledge_search_documents(query: str, *, limit: int = 20) -> List[Dict[str, Any]]:
+    """Knowledge API の metadata search を実行する。本文全文検索はしない。"""
+    if not KNOWLEDGE_API_URL:
+        raise RuntimeError("SUPPORT_AI_KNOWLEDGE_API_URL が未設定です")
+    resp = requests.get(
+        KNOWLEDGE_API_URL + "/api/search",
+        params={"q": query, "limit": int(limit)},
+        headers={"Accept": "application/json"},
+        timeout=HTTP_TIMEOUT,
+    )
+    if not resp.ok:
+        raise RuntimeError(f"Knowledge API GET /api/search -> {resp.status_code}: {resp.text[:500]}")
+    data = resp.json()
+    documents = data.get("documents") if isinstance(data, dict) else []
+    return documents if isinstance(documents, list) else []
+
+
+def knowledge_get_document(doc_id: str) -> Dict[str, Any]:
+    """Knowledge API の document 本文を取得する。"""
+    if not KNOWLEDGE_API_URL:
+        raise RuntimeError("SUPPORT_AI_KNOWLEDGE_API_URL が未設定です")
+    resp = requests.get(
+        KNOWLEDGE_API_URL + f"/api/documents/{doc_id}",
+        headers={"Accept": "application/json"},
+        timeout=HTTP_TIMEOUT,
+    )
+    if not resp.ok:
+        raise RuntimeError(f"Knowledge API GET /api/documents/{doc_id} -> {resp.status_code}: {resp.text[:500]}")
+    data = resp.json()
+    document = data.get("document") if isinstance(data, dict) else None
+    if not isinstance(document, dict):
+        raise RuntimeError(f"Knowledge API GET /api/documents/{doc_id} returned no document")
+    return document
