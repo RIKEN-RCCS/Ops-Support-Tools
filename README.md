@@ -117,6 +117,11 @@ http://127.0.0.1:18080/support-ai/monitor
 https://your-host.example.com/support-ai/monitor
 ```
 
+RAGFlow is being evaluated as a separate RAG backend candidate. It is not
+vendored into this repository, but deployment notes for serving its Web UI under
+the shared nginx HTTPS server are in
+[`docs/deployment/ragflow.md`](docs/deployment/ragflow.md).
+
 ## Move / Restore
 
 Runtime state is app-local. For a server move, stop Compose and copy the repository with these ignored runtime paths:
