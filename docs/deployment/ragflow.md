@@ -214,8 +214,161 @@ Before login, `/ragflow/api/v1/users/me` and
 `/ragflow/api/v1/users/me/models` may return `401`. That is normal; RAGFlow
 then redirects the browser to the login screen.
 
+## RAGFlow v0.26.3 Smoke Test
+
+The v0.26.3 UI differs slightly from some older guides. Use this short test
+before uploading real manuals or operational documents.
+
+### 1. Add Model Providers
+
+Open RAGFlow and go to:
+
+```text
+User icon -> Model providers
+```
+
+For an OpenAI-compatible local model server, add `OpenAI-API-Compatible`.
+
+Add a chat model:
+
+```text
+Instance name: any local label, for example riken-llm
+Model type: Chat
+Model name: the exact chat model ID exposed by the local server
+Base URL: http://LLM_SERVER:PORT/v1
+API key: use a RAGFlow-scoped token
+Max tokens: 8192, or a value suitable for the model
+Tool call: off for the first test
+Vision: off for the first test
+```
+
+Add an embedding model in the same provider:
+
+```text
+Model type: Embedding
+Model name: the exact embedding model ID exposed by the local server
+Base URL: http://LLM_SERVER:PORT/v1
+API key: use the same RAGFlow-scoped token if permitted
+```
+
+Then open `System Model Settings` and set:
+
+```text
+Chat model: the added chat model
+Embedding model: the added embedding model
+```
+
+Do not use `localhost` for a model server running on the host unless it is also
+reachable from inside the RAGFlow container. Prefer a DNS name or IP address
+that the RAGFlow container can reach.
+
+### 2. Create a Tiny Dataset
+
+Create a dataset for smoke testing and use the simplest parser settings:
+
+```text
+Parse type: General
+Built-in: General
+```
+
+Upload a small text file with this content:
+
+```text
+# RIKYU CUDA and MPI Test Note
+
+RIKYU is a supercomputer environment used for HPC workloads.
+
+For CUDA and MPI programs, users should first check the available software modules before compiling. Typical commands include module avail cuda, module avail gcc, module avail mpi, module spider cuda, module spider gcc, and module spider hpcx.
+
+If a user wants to build a CUDA-aware MPI program with GCC, the support team should confirm which CUDA, GCC, and MPI or HPC-X modules are provided on RIKYU.
+
+This test note is only for verifying RAGFlow ingestion, embedding, retrieval, and chat. It is not an official operation policy.
+```
+
+Run parsing and wait for it to finish. The first parse can be slow because the
+worker, embedding model, and indexes may all be cold. For this tiny test, a
+successful parse is more important than the first-run elapsed time.
+
+### 3. Create a Chat Assistant
+
+RAGFlow chats are based on chat assistants, not directly on datasets.
+
+Go to:
+
+```text
+Chat -> Create an assistant
+```
+
+Use settings like:
+
+```text
+Assistant name: RIKYU CUDA MPI smoke test
+Dataset / Knowledge base: select the tiny dataset
+Show quote: on
+Rerank model: empty for the first test
+Reasoning: off for the first test
+Use knowledge graph: off for the first test
+Model: the OpenAI-compatible chat model added above
+```
+
+For an HPC support-oriented prompt, replace the default system prompt with:
+
+```text
+あなたはHPCサポート向けのRAGアシスタントです。質問に対して、ナレッジベースに含まれる根拠だけを使って、簡潔で実務的な日本語で回答してください。
+
+回答方針:
+- 最終回答だけを出力してください。
+- 推論過程、内部検討、自己確認、プロンプト解釈は出力しないでください。
+- ナレッジベースに根拠がある内容だけを回答してください。
+- 根拠が不足している場合は、推測で補わず「ナレッジベースにはお探しの回答が見つかりません！」と明記してください。
+- コマンド、設定値、確認項目は箇条書きにしてください。
+- サポート担当者がそのまま確認作業に使える粒度で書いてください。
+- 公式回答や運用方針として断定しすぎないでください。
+
+こちらがナレッジベースです:
+{knowledge}
+上記がナレッジベースです。
+```
+
+### 4. Ask a Retrieval Question
+
+Ask:
+
+```text
+RIKYUでCUDA-aware MPIプログラムをGCCでビルドしたい場合、最初に何を確認すべきですか？
+```
+
+Expected shape:
+
+```text
+RIKYUでCUDA-aware MPIプログラムをGCCでビルドする場合、最初に利用可能なソフトウェアモジュールを確認する。
+
+確認対象:
+- CUDA
+- GCC
+- MPI または HPC-X
+
+確認コマンド例:
+- module avail cuda
+- module avail gcc
+- module avail mpi
+- module spider cuda
+- module spider gcc
+- module spider hpcx
+```
+
+The exact citation display may vary, for example `Fig. 1` plus the source file
+name. That is acceptable for this smoke test as long as the answer is grounded
+in the uploaded document and the source is shown.
+
+Passing this smoke test means the following path works:
+
+```text
+nginx -> RAGFlow UI -> model provider -> embedding -> dataset parse -> retrieval -> chat answer
+```
+
 ## Scope Not Covered
 
-This note does not cover dataset creation, model provider registration, document
-ingestion, RAGFlow backup/restore, or Knowledge API integration. Treat those as
-separate steps after the Web UI deployment path is stable.
+This note does not cover real dataset curation, production model selection,
+RAGFlow backup/restore, or Knowledge API integration. Treat those as separate
+steps after the Web UI and smoke test paths are stable.
