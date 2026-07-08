@@ -25,6 +25,9 @@ from secret_config import env_secret
 app = Flask(__name__)
 
 MONITOR_QUEUES = ("incoming", "incoming_followup", "pending", "pending_followup", "done", "failed")
+SEND_INTERNAL_NOTE_MARKER = os.environ.get("SUPPORT_AI_SEND_INTERNAL_NOTE_MARKER", "[SEND_INTERNAL_NOTE]")
+INTERNAL_NOTE_SENT_TAG = os.environ.get("SUPPORT_AI_INTERNAL_NOTE_SENT_TAG", "internal_note_sent")
+MAX_PUBLIC_REPLY_LEN = int(os.environ.get("SUPPORT_AI_SEND_INTERNAL_NOTE_MAX_LEN", "30000"))
 
 BASE_CSS = """
 body { color: #17202a; font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 0; background: #f7f8fa; }
@@ -224,6 +227,26 @@ def _find_context_value(payload: Any, key: str) -> str:
     return ""
 
 
+def _comment_body(comment: dict[str, Any]) -> str:
+    return str(comment.get("plain_body") or comment.get("body") or "").strip()
+
+
+def _latest_internal_note(comments: list[dict[str, Any]]) -> dict[str, Any] | None:
+    internal_notes = [
+        comment
+        for comment in comments
+        if comment.get("public") is False and _comment_body(comment)
+    ]
+    return internal_notes[-1] if internal_notes else None
+
+
+def _strip_send_internal_note_marker(body: str) -> tuple[bool, str]:
+    lines = body.splitlines()
+    if not lines or lines[0].strip() != SEND_INTERNAL_NOTE_MARKER:
+        return False, body
+    return True, "\n".join(lines[1:]).strip()
+
+
 def enqueue_ticket(ticket_id: int, *, source: str = "webhook", environment: str = "", machine: str = "") -> bool:
     """ticket_id を incoming/ に冪等に積む。新規作成したら True。"""
     common.ensure_spool_dirs()
@@ -392,6 +415,65 @@ def zendesk_followup_webhook():
     comment_id = _find_comment_id(payload)
     queued = enqueue_followup(ticket_id, comment_id=comment_id)
     return jsonify({"ok": True, "job": "followup", "ticket_id": ticket_id, "comment_id": comment_id, "queued": queued})
+
+
+@app.post("/zendesk/webhook/send_internal_note")
+def zendesk_send_internal_note_webhook():
+    """最新の社内メモを AI なしで公開返信へ転送する。
+
+    Zendesk trigger から ticket_id だけを受け、Ticket Comments API で最新の
+    public=false comment を取得し、その本文を Ticket Update API の public=true
+    comment として投稿する。
+    """
+    if not _authorized():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    payload = request.get_json(silent=True) or {}
+    ticket_id = _find_ticket_id(payload)
+    if ticket_id is None:
+        return jsonify({"ok": False, "error": "ticket_id not found"}), 400
+    try:
+        comments = common.fetch_ticket_comments(ticket_id)
+        note = _latest_internal_note(comments)
+        if not note:
+            return jsonify({"ok": False, "ticket_id": ticket_id, "error": "internal note not found"}), 404
+        body = _comment_body(note)
+        has_marker, public_body = _strip_send_internal_note_marker(body)
+        if not has_marker:
+            return jsonify({
+                "ok": False,
+                "ticket_id": ticket_id,
+                "error": "send marker not found on first line",
+                "expected_marker": SEND_INTERNAL_NOTE_MARKER,
+                "source_comment_id": note.get("id"),
+            }), 400
+        if not public_body:
+            return jsonify({"ok": False, "ticket_id": ticket_id, "error": "internal note body is empty"}), 400
+        if len(public_body) > MAX_PUBLIC_REPLY_LEN:
+            return jsonify({
+                "ok": False,
+                "ticket_id": ticket_id,
+                "error": "internal note body is too long",
+                "max_len": MAX_PUBLIC_REPLY_LEN,
+                "body_len": len(public_body),
+            }), 413
+        result = common.post_public_reply(
+            ticket_id,
+            public_body,
+            tags=[INTERNAL_NOTE_SENT_TAG],
+        )
+        return jsonify({
+            "ok": True,
+            "job": "send_internal_note",
+            "ticket_id": ticket_id,
+            "source_comment_id": note.get("id"),
+            "body_len": len(public_body),
+            "marker_removed": SEND_INTERNAL_NOTE_MARKER,
+            "tag": INTERNAL_NOTE_SENT_TAG,
+            "zendesk_result": bool(result),
+        })
+    except Exception as exc:  # noqa: BLE001
+        common.log(f"send_internal_note failed ticket_{ticket_id}: {exc}")
+        return jsonify({"ok": False, "ticket_id": ticket_id, "error": str(exc)[:300]}), 502
 
 
 def main() -> None:

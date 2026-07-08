@@ -1,8 +1,9 @@
 """共通基盤: 設定・スプール管理・Zendesk クライアント。
 
 安全設計(spec §6)に従い、このモジュールの Zendesk 書き込み操作は
-`post_internal_note`(内部メモ追記 + タグ付与)のみを提供する。
-クローズ / アサイン変更 / 公開返信を行う関数は実装しない。
+通常パイプラインでは `post_internal_note`(内部メモ追記 + タグ付与)に限定する。
+例外として、明示 webhook から最新の内部メモをそのまま公開返信へ転送する
+`post_public_reply` を提供する。クローズ / 標準 assignee 変更は行わない。
 """
 
 from __future__ import annotations
@@ -651,6 +652,31 @@ def post_internal_note(ticket_id: int, body: str, tags: Optional[List[str]] = No
         json_body={"ticket": ticket_update},
     )
     return result
+
+
+def post_public_reply(
+    ticket_id: int,
+    body: str,
+    tags: Optional[List[str]] = None,
+    remove_tags: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """当該チケットへ公開返信(public:true)を追記し、タグを付与する。
+
+    AI は介在させず、呼び出し側が渡した本文をそのまま Zendesk へ送る。
+    既存タグを消さないよう、tags/remove_tags は現在のタグへ差分適用する。
+    """
+    comment: Dict[str, Any] = {"body": body, "public": True}
+    ticket_update: Dict[str, Any] = {"comment": comment}
+    if tags or remove_tags:
+        current = fetch_ticket(ticket_id).get("tags") or []
+        remove = {str(tag) for tag in (remove_tags or []) if tag}
+        merged = {str(tag) for tag in current if tag and str(tag) not in remove}
+        merged.update(str(tag) for tag in (tags or []) if tag)
+        ticket_update["tags"] = sorted(merged)
+    return zd_request(
+        "PUT", f"/api/v2/tickets/{ticket_id}.json",
+        json_body={"ticket": ticket_update},
+    )
 
 
 # --------------------------------------------------------------------------
