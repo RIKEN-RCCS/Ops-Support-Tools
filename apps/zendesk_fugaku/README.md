@@ -1,13 +1,13 @@
 # zendesk_fugaku
 
-`your-subdomain.zendesk.com` 向けの業者用 Zendesk API 中継サーバです。
+`your-subdomain.zendesk.com` 向けの外部連携用 Zendesk API 中継サーバです。
 
-Zendesk の OAuth token はこの中継サーバだけが保持します。業者や監視サーバには Zendesk token を渡さず、業者向けの限定 token でこの中継サーバを叩かせます。
+Zendesk の OAuth token はこの中継サーバだけが保持します。外部連携システムや監視システムには Zendesk token を共有せず、中継サーバ用の限定 Bearer token で認証します。
 
 ## Role
 
 ```text
-vendor/server tool
+external integration / monitoring system
   -> zendesk_fugaku
   -> Bearer token check
   -> OAuth refresh if needed
@@ -16,7 +16,7 @@ vendor/server tool
 
 OAuth refresh は次の2経路で実行します。
 
-- 業者 endpoint 処理時: Zendesk API 呼び出し前に `expires_at` を確認し、期限が近ければ refresh
+- 外部連携 endpoint 処理時: Zendesk API 呼び出し前に `expires_at` を確認し、期限が近ければ refresh
 - 定期 refresh: `ZENDESK_FUGAKU_PERIODIC_REFRESH_SECONDS` ごとに期限確認し、必要なら refresh
 
 refresh token rotation を想定し、`access_token` と `refresh_token` を含む token bundle 全体をファイルロック付きで原子的に上書きします。
@@ -77,7 +77,7 @@ chmod 640 apps/zendesk_fugaku/secrets/zendesk_fugaku_vendor_token
 
 外向きの nginx URL は `/zendesk_fugaku` prefix 付きです。コンテナ内部の Flask endpoint は prefix なしです。
 
-`/zendesk_fugaku/api/v2/` は業者/監視サーバの送信元IP制限と Bearer token 認証の両方を通った場合だけ Zendesk へ転送します。
+`/zendesk_fugaku/api/v2/` は外部連携元/監視システムの送信元IP制限と Bearer token 認証の両方を通った場合だけ Zendesk へ転送します。
 
 旧 `/zendesk_fugaku/vendor/alerts` は廃止済みです。
 
@@ -156,7 +156,7 @@ Authorization: Bearer <vendor-token>
 Content-Type: application/json
 ```
 
-業者側が `curl -d` の既定で `POST` してくる場合も、中継サーバ内で Zendesk の ticket update 用 `PUT` として転送します。
+連携元が `curl -d` の既定で `POST` する場合も、中継サーバ内で Zendesk の ticket update 用 `PUT` として転送します。
 
 外向き:
 
@@ -205,7 +205,7 @@ docker compose build zendesk-fugaku
 docker compose up -d zendesk-fugaku
 ```
 
-nginx では `/zendesk_fugaku/api/v2/` など必要最小限の path だけを公開し、業者/監視サーバの送信元IPで制限してください。
+nginx では `/zendesk_fugaku/api/v2/` など必要最小限の path だけを公開し、外部連携元/監視システムの送信元IPで制限してください。
 
 例:
 
@@ -215,4 +215,4 @@ nginx では `/zendesk_fugaku/api/v2/` など必要最小限の path だけを�
 
 OAuth refresh は定期refreshと、Zendesk API 呼び出し前の期限確認でアプリ内部だけが実行します。refresh専用の外部endpointは持ちません。
 
-`/events` も運用確認用なので、外部公開する場合は業者/運用者IPに絞ってください。
+`/events` も運用確認用なので、外部公開する場合は連携元/運用者IPに絞ってください。

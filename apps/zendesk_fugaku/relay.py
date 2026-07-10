@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Fugaku Zendesk vendor API relay.
+"""Fugaku Zendesk external API relay.
 
-The relay accepts vendor requests through a narrow local API, refreshes OAuth
+The relay accepts external integration requests through a narrow local API, refreshes OAuth
 tokens as needed, and forwards only the Zendesk API operations used by the
-vendor workflow. It never prints OAuth token values.
+integration workflow. It never prints OAuth token values.
 """
 
 from __future__ import annotations
@@ -654,7 +654,7 @@ def periodic_refresh(config: Config) -> None:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Fugaku Zendesk vendor alert relay")
+    parser = argparse.ArgumentParser(description="Fugaku Zendesk external API relay")
     parser.add_argument("--host", default=os.environ.get("ZENDESK_FUGAKU_HOST", "0.0.0.0"))
     parser.add_argument("--port", type=int, default=int(os.environ.get("ZENDESK_FUGAKU_PORT", "8080")))
     args = parser.parse_args()
