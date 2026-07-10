@@ -79,8 +79,6 @@ chmod 640 apps/zendesk_fugaku/secrets/zendesk_fugaku_relay_token
 
 `/zendesk_fugaku/api/v2/` は外部連携元/監視システムの送信元IP制限と Bearer token 認証の両方を通った場合だけ Zendesk へ転送します。
 
-旧 `/zendesk_fugaku/vendor/alerts` は廃止済みです。
-
 ### Health
 
 ```text
