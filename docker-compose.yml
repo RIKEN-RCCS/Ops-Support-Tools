@@ -212,12 +212,12 @@ services:
     environment:
       TZ: ${OPS_SUPPORT_TOOLS_TZ:-UTC}
       ZENDESK_FUGAKU_OAUTH_CLIENT_SECRET_FILE: /run/secrets/zendesk_fugaku_oauth_client_secret
-      ZENDESK_FUGAKU_VENDOR_TOKEN_FILE: /run/secrets/zendesk_fugaku_vendor_token
+      ZENDESK_FUGAKU_RELAY_TOKEN_FILE: /run/secrets/zendesk_fugaku_relay_token
       ZENDESK_FUGAKU_OAUTH_TOKEN_BUNDLE_FILE: /data/zendesk_oauth_token_bundle.json
       ZENDESK_FUGAKU_DB_FILE: /data/events.sqlite
     secrets:
       - zendesk_fugaku_oauth_client_secret
-      - zendesk_fugaku_vendor_token
+      - zendesk_fugaku_relay_token
     ports:
       - "127.0.0.1:18280:8080"
     volumes:
@@ -239,5 +239,5 @@ secrets:
     file: ./apps/knowledge-api/secrets/knowledge_api_write_token
   zendesk_fugaku_oauth_client_secret:
     file: ./apps/zendesk_fugaku/secrets/zendesk_fugaku_oauth_client_secret
-  zendesk_fugaku_vendor_token:
-    file: ./apps/zendesk_fugaku/secrets/zendesk_fugaku_vendor_token
+  zendesk_fugaku_relay_token:
+    file: ./apps/zendesk_fugaku/secrets/zendesk_fugaku_relay_token

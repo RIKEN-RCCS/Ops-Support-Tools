@@ -29,7 +29,7 @@ refresh token rotation を想定し、`access_token` と `refresh_token` を含�
 apps/zendesk_fugaku/.env
 apps/zendesk_fugaku/oauth.env
 apps/zendesk_fugaku/secrets/zendesk_fugaku_oauth_client_secret
-apps/zendesk_fugaku/secrets/zendesk_fugaku_vendor_token
+apps/zendesk_fugaku/secrets/zendesk_fugaku_relay_token
 apps/zendesk_fugaku/data/zendesk_oauth_token_bundle.json
 apps/zendesk_fugaku/data/events.sqlite
 ```
@@ -51,7 +51,7 @@ ZENDESK_FUGAKU_URL=https://your-subdomain.zendesk.com
 ZENDESK_FUGAKU_OAUTH_CLIENT_IDENTIFIER=replace-with-client-identifier
 ZENDESK_FUGAKU_OAUTH_CLIENT_SECRET_FILE=/run/secrets/zendesk_fugaku_oauth_client_secret
 ZENDESK_FUGAKU_OAUTH_TOKEN_BUNDLE_FILE=/data/zendesk_oauth_token_bundle.json
-ZENDESK_FUGAKU_VENDOR_TOKEN_FILE=/run/secrets/zendesk_fugaku_vendor_token
+ZENDESK_FUGAKU_RELAY_TOKEN_FILE=/run/secrets/zendesk_fugaku_relay_token
 ```
 
 初回の OAuth token bundle は `apps/zendesk-oauth-tools/` と同じ authorization code flow で作成し、`apps/zendesk_fugaku/data/zendesk_oauth_token_bundle.json` に配置します。`apps/zendesk-oauth-tools/.env` を一時的に Fugaku 用へ向ける場合は、少なくとも次の値を Fugaku 用にします。
@@ -70,7 +70,7 @@ Docker ではコンテナ内の実行ユーザーを `10003:1000` にしてい�
 mkdir -p apps/zendesk_fugaku/data apps/zendesk_fugaku/secrets
 sudo chown -R 10003:1000 apps/zendesk_fugaku/data
 chmod 640 apps/zendesk_fugaku/secrets/zendesk_fugaku_oauth_client_secret
-chmod 640 apps/zendesk_fugaku/secrets/zendesk_fugaku_vendor_token
+chmod 640 apps/zendesk_fugaku/secrets/zendesk_fugaku_relay_token
 ```
 
 ## Endpoints
@@ -97,7 +97,7 @@ GET https://support.example.com/zendesk_fugaku/health
 
 ```text
 GET /api/v2/search.json?query=accounts:<外部ユーザーID>
-Authorization: Bearer <vendor-token>
+Authorization: Bearer <relay-token>
 ```
 
 外向き:
@@ -110,7 +110,7 @@ GET https://support.example.com/zendesk_fugaku/api/v2/search.json?query=accounts
 
 ```text
 GET /api/v2/organizations/search.json?name=<組織ID>
-Authorization: Bearer <vendor-token>
+Authorization: Bearer <relay-token>
 ```
 
 外向き:
@@ -123,7 +123,7 @@ GET https://support.example.com/zendesk_fugaku/api/v2/organizations/search.json?
 
 ```text
 GET /api/v2/search.json?query=ticket_id:<チケット番号>
-Authorization: Bearer <vendor-token>
+Authorization: Bearer <relay-token>
 ```
 
 外向き:
@@ -136,7 +136,7 @@ GET https://support.example.com/zendesk_fugaku/api/v2/search.json?query=ticket_i
 
 ```text
 POST /api/v2/tickets.json
-Authorization: Bearer <vendor-token>
+Authorization: Bearer <relay-token>
 Content-Type: application/json
 ```
 
@@ -152,7 +152,7 @@ POST https://support.example.com/zendesk_fugaku/api/v2/tickets.json
 
 ```text
 PUT /api/v2/tickets/<チケット番号>.json
-Authorization: Bearer <vendor-token>
+Authorization: Bearer <relay-token>
 Content-Type: application/json
 ```
 
@@ -169,7 +169,7 @@ POST https://support.example.com/zendesk_fugaku/api/v2/tickets/<チケット番�
 
 ```text
 POST /api/v2/uploads.json?filename=<ファイル名>
-Authorization: Bearer <vendor-token>
+Authorization: Bearer <relay-token>
 Content-Type: application/binary
 ```
 
@@ -185,7 +185,7 @@ POST https://support.example.com/zendesk_fugaku/api/v2/uploads.json?filename=<�
 
 ```text
 GET /events?limit=50
-Authorization: Bearer <vendor-token>
+Authorization: Bearer <relay-token>
 ```
 
 直近の処理状態を確認します。本文や token は返さず、`event_id`、`source`、`status`、Zendesk ticket id、時刻、短い error だけを返します。`event_id` は `Idempotency-Key`、`X-Request-Id`、`X-Event-Id` のいずれかがあればそれを使い、なければ中継サーバが生成します。
