@@ -8,6 +8,9 @@ secrets/
 apps/*/.env
 apps/*/.env.*
 !apps/*/.env.example
+apps/*/oauth.env
+apps/*/oauth.env.*
+!apps/*/oauth.env.example
 apps/*/secrets/
 apps/*/config/
 apps/*/data/
