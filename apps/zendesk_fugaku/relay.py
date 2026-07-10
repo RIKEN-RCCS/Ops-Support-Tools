@@ -143,7 +143,7 @@ class Config:
     client_secret: str
     token_bundle_file: Path
     scopes: list[str]
-    vendor_token: str
+    relay_token: str
     db_file: Path
     refresh_margin_seconds: int
     periodic_refresh_seconds: int
@@ -166,12 +166,12 @@ class Config:
                 str(data_dir / "zendesk_oauth_token_bundle.json"),
             )),
             scopes=scopes or ["read", "write"],
-            vendor_token=read_secret("ZENDESK_FUGAKU_VENDOR_TOKEN"),
+            relay_token=read_secret("ZENDESK_FUGAKU_RELAY_TOKEN"),
             db_file=Path(os.environ.get("ZENDESK_FUGAKU_DB_FILE", str(data_dir / "events.sqlite"))),
             refresh_margin_seconds=int(os.environ.get("ZENDESK_FUGAKU_REFRESH_MARGIN_SECONDS", "600")),
             periodic_refresh_seconds=int(os.environ.get("ZENDESK_FUGAKU_PERIODIC_REFRESH_SECONDS", "1200")),
             default_public_comment=env_bool("ZENDESK_FUGAKU_DEFAULT_PUBLIC_COMMENT", True),
-            default_tags=env_list("ZENDESK_FUGAKU_DEFAULT_TAGS", ["vendor_alert", "fugaku_alert"]),
+            default_tags=env_list("ZENDESK_FUGAKU_DEFAULT_TAGS", ["external_relay", "fugaku_alert"]),
             ticket_subject_prefix=os.environ.get("ZENDESK_FUGAKU_TICKET_SUBJECT_PREFIX", "[Fugaku Alert]"),
             timeout=float(os.environ.get("ZENDESK_FUGAKU_HTTP_TIMEOUT", "30")),
         )
@@ -184,8 +184,8 @@ class Config:
             missing.append("ZENDESK_FUGAKU_OAUTH_CLIENT_IDENTIFIER")
         if not self.client_secret:
             missing.append("ZENDESK_FUGAKU_OAUTH_CLIENT_SECRET or *_FILE")
-        if not self.vendor_token:
-            missing.append("ZENDESK_FUGAKU_VENDOR_TOKEN or *_FILE")
+        if not self.relay_token:
+            missing.append("ZENDESK_FUGAKU_RELAY_TOKEN or *_FILE")
         if missing:
             raise RuntimeError("missing config: " + ", ".join(missing))
 
@@ -490,8 +490,8 @@ def build_app(config: Config) -> Flask:
             missing.append("ZENDESK_FUGAKU_OAUTH_CLIENT_IDENTIFIER")
         if not config.client_secret:
             missing.append("ZENDESK_FUGAKU_OAUTH_CLIENT_SECRET or *_FILE")
-        if not config.vendor_token:
-            missing.append("ZENDESK_FUGAKU_VENDOR_TOKEN or *_FILE")
+        if not config.relay_token:
+            missing.append("ZENDESK_FUGAKU_RELAY_TOKEN or *_FILE")
         if not config.token_bundle_file.exists():
             missing.append("ZENDESK_FUGAKU_OAUTH_TOKEN_BUNDLE_FILE")
         return missing
@@ -502,7 +502,7 @@ def build_app(config: Config) -> Flask:
         if header.lower().startswith("bearer "):
             token = header.split(" ", 1)[1].strip()
         token = token or request.headers.get("X-Fugaku-Relay-Token", "").strip()
-        return bool(token) and hmac.compare_digest(token, config.vendor_token)
+        return bool(token) and hmac.compare_digest(token, config.relay_token)
 
     def require_ready_and_authorized() -> Response | None:
         missing = missing_config()
@@ -627,7 +627,7 @@ def build_app(config: Config) -> Flask:
 
     @app.get("/events")
     def recent_events():
-        if not config.vendor_token:
+        if not config.relay_token:
             return jsonify({"ok": False, "error": "not configured", "missing_config": missing_config()}), 503
         if not authorized():
             return jsonify({"ok": False, "error": "unauthorized"}), 401
