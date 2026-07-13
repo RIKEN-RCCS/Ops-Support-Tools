@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from fnmatch import fnmatch
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlparse
 
 import requests
 
@@ -38,6 +39,12 @@ ZENDESK_URL = os.environ.get("ZENDESK_URL", "").rstrip("/")
 ZENDESK_EMAIL = os.environ.get("ZENDESK_EMAIL", "")
 # API トークン(値はログに出さない)。本番では ZENDESK_KEY_FILE を使う。
 _ZENDESK_KEY = env_secret("ZENDESK_KEY")
+ZENDESK_RELAY_URL = (
+    os.environ.get("ZENDESK_RELAY_URL")
+    or os.environ.get("ZENDESK_RCCS_RELAY_URL")
+    or ""
+).rstrip("/")
+_ZENDESK_RELAY_TOKEN = env_secret("ZENDESK_RELAY_TOKEN") or env_secret("ZENDESK_RCCS_RELAY_TOKEN")
 
 SPOOL_SUBDIRS = (
     "incoming",
@@ -344,16 +351,54 @@ def _zd_auth():
     return (f"{ZENDESK_EMAIL}/token", _ZENDESK_KEY)
 
 
+def _use_zendesk_relay() -> bool:
+    return bool(ZENDESK_RELAY_URL)
+
+
+def _zd_path_from_url_or_path(value: str) -> str:
+    """Zendesk/relay の full URL または path を '/api/v2/...' 形式へ寄せる。"""
+    text = str(value or "").strip()
+    if not text:
+        return text
+    if ZENDESK_URL and text.startswith(ZENDESK_URL):
+        text = text[len(ZENDESK_URL):]
+    elif ZENDESK_RELAY_URL and text.startswith(ZENDESK_RELAY_URL):
+        text = text[len(ZENDESK_RELAY_URL):]
+    elif text.startswith("http://") or text.startswith("https://"):
+        parsed = urlparse(text)
+        text = parsed.path
+        if parsed.query:
+            text += "?" + parsed.query
+    return text if text.startswith("/") else "/" + text
+
+
+def _zd_url(path: str) -> str:
+    normalized = _zd_path_from_url_or_path(path)
+    if _use_zendesk_relay():
+        return ZENDESK_RELAY_URL + normalized
+    if not ZENDESK_URL:
+        raise RuntimeError("ZENDESK_URL が未設定です")
+    return ZENDESK_URL + normalized
+
+
 def zd_request(method: str, path: str, *, params: Optional[dict] = None,
                json_body: Optional[dict] = None) -> Dict[str, Any]:
     """Zendesk REST API への薄いラッパ。path は '/api/v2/...' で渡す。"""
-    url = ZENDESK_URL + path if path.startswith("/") else f"{ZENDESK_URL}/{path}"
+    url = _zd_url(path)
+    headers = {"Content-Type": "application/json", "Accept": "application/json"}
+    auth = None
+    if _use_zendesk_relay():
+        if not _ZENDESK_RELAY_TOKEN:
+            raise RuntimeError("ZENDESK_RELAY_TOKEN / ZENDESK_RELAY_TOKEN_FILE が未設定です")
+        headers["Authorization"] = "Bearer " + _ZENDESK_RELAY_TOKEN
+    else:
+        auth = _zd_auth()
     resp = requests.request(
         method.upper(), url,
-        auth=_zd_auth(),
+        auth=auth,
         params=params,
         json=json_body,
-        headers={"Content-Type": "application/json", "Accept": "application/json"},
+        headers=headers,
         timeout=HTTP_TIMEOUT,
     )
     if not resp.ok:
@@ -375,8 +420,8 @@ def search_tickets(query: str) -> List[Dict[str, Any]]:
         next_page = data.get("next_page")
         if not next_page:
             break
-        # next_page はフル URL。path/params をそれに差し替える
-        path = next_page[len(ZENDESK_URL):] if next_page.startswith(ZENDESK_URL) else next_page
+        # next_page はフル URL のため、relay 経由でも再利用できる path へ寄せる。
+        path = _zd_path_from_url_or_path(next_page)
         params = None
     return out
 
@@ -395,7 +440,7 @@ def fetch_ticket_comments(ticket_id: int) -> List[Dict[str, Any]]:
         next_page = data.get("next_page")
         if not next_page:
             break
-        path = next_page[len(ZENDESK_URL):] if next_page.startswith(ZENDESK_URL) else next_page
+        path = _zd_path_from_url_or_path(next_page)
         params = None
     return out
 
@@ -406,7 +451,7 @@ def fetch_ticket(ticket_id: int) -> Dict[str, Any]:
 
 
 def zendesk_healthcheck() -> Dict[str, Any]:
-    """Zendesk API token の疎通確認。"""
+    """Zendesk API の疎通確認。OAuth relay 設定時は relay 経由で確認する。"""
     return zd_request("GET", "/api/v2/users/me.json").get("user", {})
 
 
@@ -421,7 +466,7 @@ def list_users(*, role: Optional[str] = None) -> List[Dict[str, Any]]:
         next_page = data.get("next_page")
         if not next_page:
             break
-        path = next_page[len(ZENDESK_URL):] if next_page.startswith(ZENDESK_URL) else next_page
+        path = _zd_path_from_url_or_path(next_page)
         params = None
     return out
 

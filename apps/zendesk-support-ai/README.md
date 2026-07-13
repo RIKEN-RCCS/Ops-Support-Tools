@@ -66,7 +66,9 @@ Zendesk の新規チケット一次トリアージ、追加質問への返信ド
 | `SUPPORT_AI_ENVIRONMENT_CANDIDATES` | triage AI が本文から推定してよい environment 候補。カンマ区切り |
 | `SUPPORT_AI_MACHINE_CANDIDATES` | triage AI が本文から推定してよい machine 候補。カンマ区切り |
 | `SUPPORT_AI_MACHINE_ALIAS_MAP` | machine の一意な表記ゆれを canonical 名へ正規化する JSON map |
-| `ZENDESK_URL` / `ZENDESK_EMAIL` / `ZENDESK_KEY` / `ZENDESK_KEY_FILE` | Zendesk API token 認証 |
+| `ZENDESK_RELAY_URL` | Zendesk OAuth relay の内部URL。Docker Compose では `http://zendesk-rccs:8080` |
+| `ZENDESK_RELAY_TOKEN` / `ZENDESK_RELAY_TOKEN_FILE` | Zendesk OAuth relay 呼び出し用 Bearer token。Docker では secrets/zendesk_rccs_relay_token を使う |
+| `ZENDESK_URL` / `ZENDESK_EMAIL` / `ZENDESK_KEY` / `ZENDESK_KEY_FILE` | 旧 Zendesk API token 認証。`ZENDESK_RELAY_URL` 未設定時の移行用 fallback |
 | `SUPPORT_AI_AGENTS_FILE` | 担当者名簿 JSON |
 | `SUPPORT_AI_STARTUP_CHECKS` | コンテナ起動時に preflight を実行する |
 | `SUPPORT_AI_STARTUP_RETRIES` | Zendesk/LLM 疎通確認のリトライ回数 |
@@ -105,7 +107,7 @@ Docker では [`startup.py`](startup.py) が entrypoint です。各サービス
 
 - `SUPPORT_AI_QUEUE_DIR` のディレクトリ作成
 - `SUPPORT_AI_AGENTS_FILE` が無ければ `agents.example.json` から初期生成
-- Zendesk API token の疎通確認
+- Zendesk API の疎通確認。`ZENDESK_RELAY_URL` 設定時は OAuth relay 経由
 - LLM endpoint の疎通確認
 - Zendesk から light agent 一覧を取得して `agents.json` を更新
 
@@ -197,9 +199,20 @@ Authorization: Bearer replace-me
 X-Support-AI-Webhook-Token: replace-me
 ```
 
-## Zendesk OAuth Migration
+## Zendesk OAuth Relay
 
-Zendesk OAuth 移行の調査、token 作成、refresh 検証は、この web app / Docker service には組み込まず、独立した CLI として [`../zendesk-oauth-tools`](../zendesk-oauth-tools) で扱います。Support AI 本体は、OAuth運用が固まるまでは従来の Zendesk API token 認証を使います。
+Docker Compose 本番運用では Zendesk API token 認証ではなく、[`../zendesk_rccs`](../zendesk_rccs) の OAuth relay を使います。
+
+```text
+support-ai worker
+  -> ZENDESK_RELAY_URL=http://zendesk-rccs:8080
+  -> zendesk_rccs relay
+  -> R-CCS Zendesk OAuth API
+```
+
+Support AI worker には OAuth access token / refresh token を渡しません。worker へ渡すのは relay 呼び出し用の `ZENDESK_RELAY_TOKEN_FILE` だけです。OAuth client secret と token bundle は `apps/zendesk_rccs/` 側に置きます。
+
+旧 API token 用の `ZENDESK_KEY_FILE` は、`ZENDESK_RELAY_URL` が未設定のときだけ fallback として使われます。Compose の support-ai services には渡しません。
 
 ## Triage Gate and Investigation Case
 
@@ -429,7 +442,7 @@ cp apps/zendesk-support-ai/.env.example apps/zendesk-support-ai/.env
 mkdir -p apps/zendesk-support-ai/secrets
 # API key/token は .env ではなく次のファイルに保存します。
 # apps/zendesk-support-ai/secrets/llm_api_key
-# apps/zendesk-support-ai/secrets/zendesk_key
+# apps/zendesk_rccs/secrets/zendesk_rccs_relay_token
 # apps/zendesk-support-ai/secrets/support_ai_webhook_token
 # apps/zendesk-support-ai/secrets/support_ai_queue_key
 OPS_SUPPORT_TOOLS_TZ=Asia/Tokyo docker compose up --build
