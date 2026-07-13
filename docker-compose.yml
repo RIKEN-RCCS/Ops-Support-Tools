@@ -4,14 +4,15 @@ x-support-secret-env: &support-secret-env
   TZ: ${OPS_SUPPORT_TOOLS_TZ:-UTC}
   SUPPORT_AI_WEBHOOK_TOKEN_FILE: /run/secrets/support_ai_webhook_token
   LLM_API_KEY_FILE: /run/secrets/llm_api_key
-  ZENDESK_KEY_FILE: /run/secrets/zendesk_key
+  ZENDESK_RELAY_URL: http://zendesk-rccs:8080
+  ZENDESK_RELAY_TOKEN_FILE: /run/secrets/zendesk_rccs_relay_token
   SUPPORT_AI_QUEUE_KEY_FILE: /run/secrets/support_ai_queue_key
   SUPPORT_AI_KNOWLEDGE_API_URL: http://knowledge-api:8080
   SUPPORT_AI_CREATE_KNOWLEDGE_RUNS: "1"
 
 x-support-secrets: &support-secrets
   - llm_api_key
-  - zendesk_key
+  - zendesk_rccs_relay_token
   - support_ai_webhook_token
   - support_ai_queue_key
 
@@ -33,6 +34,7 @@ services:
     restart: unless-stopped
     depends_on:
       - knowledge-api
+      - zendesk-rccs
 
   generator:
     build: ./apps/zendesk-support-ai
@@ -49,6 +51,7 @@ services:
     restart: unless-stopped
     depends_on:
       - knowledge-api
+      - zendesk-rccs
 
   poster:
     build: ./apps/zendesk-support-ai
@@ -63,6 +66,8 @@ services:
       - ./apps/zendesk-support-ai/data:/data/queue
       - ./apps/zendesk-support-ai/config:/config
     restart: unless-stopped
+    depends_on:
+      - zendesk-rccs
 
   followup:
     build: ./apps/zendesk-support-ai
@@ -77,6 +82,8 @@ services:
       - ./apps/zendesk-support-ai/data:/data/queue
       - ./apps/zendesk-support-ai/config:/config
     restart: unless-stopped
+    depends_on:
+      - zendesk-rccs
 
   followup-responder:
     build: ./apps/zendesk-support-ai
@@ -91,6 +98,8 @@ services:
       - ./apps/zendesk-support-ai/data:/data/queue
       - ./apps/zendesk-support-ai/config:/config
     restart: unless-stopped
+    depends_on:
+      - zendesk-rccs
 
   runbook-worker:
     build: ./apps/zendesk-support-ai
@@ -107,6 +116,7 @@ services:
     restart: unless-stopped
     depends_on:
       - knowledge-api
+      - zendesk-rccs
 
   runbook-review-worker:
     build: ./apps/zendesk-support-ai
@@ -123,6 +133,7 @@ services:
     restart: unless-stopped
     depends_on:
       - knowledge-api
+      - zendesk-rccs
 
   investigation-router-worker:
     build: ./apps/zendesk-support-ai
@@ -139,6 +150,7 @@ services:
     restart: unless-stopped
     depends_on:
       - knowledge-api
+      - zendesk-rccs
 
   knowledge-research-worker:
     build: ./apps/zendesk-support-ai
@@ -155,6 +167,7 @@ services:
     restart: unless-stopped
     depends_on:
       - knowledge-api
+      - zendesk-rccs
 
   real-machine-task-splitter-worker:
     build: ./apps/zendesk-support-ai
@@ -171,6 +184,7 @@ services:
     restart: unless-stopped
     depends_on:
       - knowledge-api
+      - zendesk-rccs
 
   answer-synthesis-worker:
     build: ./apps/zendesk-support-ai
@@ -187,6 +201,7 @@ services:
     restart: unless-stopped
     depends_on:
       - knowledge-api
+      - zendesk-rccs
 
   knowledge-api:
     build: ./apps/knowledge-api
@@ -224,11 +239,30 @@ services:
       - ./apps/zendesk_fugaku/data:/data
     restart: unless-stopped
 
+  zendesk-rccs:
+    build: ./apps/zendesk_rccs
+    user: "10004:1000"
+    env_file:
+      - path: ./apps/zendesk_rccs/.env
+        required: false
+    environment:
+      TZ: ${OPS_SUPPORT_TOOLS_TZ:-UTC}
+      ZENDESK_RCCS_OAUTH_CLIENT_SECRET_FILE: /run/secrets/zendesk_rccs_oauth_client_secret
+      ZENDESK_RCCS_RELAY_TOKEN_FILE: /run/secrets/zendesk_rccs_relay_token
+      ZENDESK_RCCS_OAUTH_TOKEN_BUNDLE_FILE: /data/zendesk_oauth_token_bundle.json
+      ZENDESK_RCCS_DB_FILE: /data/events.sqlite
+    secrets:
+      - zendesk_rccs_oauth_client_secret
+      - zendesk_rccs_relay_token
+    ports:
+      - "127.0.0.1:18380:8080"
+    volumes:
+      - ./apps/zendesk_rccs/data:/data
+    restart: unless-stopped
+
 secrets:
   llm_api_key:
     file: ./apps/zendesk-support-ai/secrets/llm_api_key
-  zendesk_key:
-    file: ./apps/zendesk-support-ai/secrets/zendesk_key
   support_ai_webhook_token:
     file: ./apps/zendesk-support-ai/secrets/support_ai_webhook_token
   support_ai_queue_key:
@@ -241,3 +275,7 @@ secrets:
     file: ./apps/zendesk_fugaku/secrets/zendesk_fugaku_oauth_client_secret
   zendesk_fugaku_relay_token:
     file: ./apps/zendesk_fugaku/secrets/zendesk_fugaku_relay_token
+  zendesk_rccs_oauth_client_secret:
+    file: ./apps/zendesk_rccs/secrets/zendesk_rccs_oauth_client_secret
+  zendesk_rccs_relay_token:
+    file: ./apps/zendesk_rccs/secrets/zendesk_rccs_relay_token
