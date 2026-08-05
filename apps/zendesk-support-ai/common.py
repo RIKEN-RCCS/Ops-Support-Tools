@@ -3,7 +3,8 @@
 安全設計に従い、このモジュールの Zendesk 書き込み操作は
 通常パイプラインでは `post_internal_note`(内部メモ追記 + タグ付与)に限定する。
 例外として、明示 webhook から最新の内部メモをそのまま公開返信へ転送する
-`post_public_reply` を提供する。クローズ / 標準 assignee 変更は行わない。
+`post_public_reply` を提供する。また SPECIAL チケットのみ、タグ同期済みの
+標準担当者へ assignee を設定する例外を持つ。クローズは行わない。
 """
 
 from __future__ import annotations
@@ -70,6 +71,12 @@ AGENTS_TEMPLATE_FILE = Path(os.environ.get(
 ))
 ASSIGNEE_FIELD_ID_ENV = os.environ.get("SUPPORT_AI_ASSIGNEE_FIELD_ID", "").strip()
 KNOWLEDGE_API_URL = os.environ.get("SUPPORT_AI_KNOWLEDGE_API_URL", "").rstrip("/")
+SPECIAL_SUPPORT_AREA = os.environ.get("SUPPORT_AI_SPECIAL_SUPPORT_AREA", "special").strip().lower()
+SPECIAL_AGENT_TAG = os.environ.get("SUPPORT_AI_SPECIAL_AGENT_TAG", "special_support").strip()
+SPECIAL_GROUP_ID_ENV = os.environ.get("SUPPORT_AI_SPECIAL_GROUP_ID", "").strip()
+SPECIAL_GROUP_NAME = os.environ.get("SUPPORT_AI_SPECIAL_GROUP_NAME", "SPECIAL").strip()
+PASSKEY_SUPPORT_AREA = os.environ.get("SUPPORT_AI_PASSKEY_SUPPORT_AREA", "passkey").strip().lower()
+PASSKEY_AGENT_TAG = os.environ.get("SUPPORT_AI_PASSKEY_AGENT_TAG", "authentication_support").strip()
 
 
 def log(*args: Any) -> None:
@@ -471,6 +478,22 @@ def list_users(*, role: Optional[str] = None) -> List[Dict[str, Any]]:
     return out
 
 
+def list_groups() -> List[Dict[str, Any]]:
+    """Zendesk groups をページングして取得する。"""
+    out: List[Dict[str, Any]] = []
+    params: Optional[dict] = {}
+    path = "/api/v2/groups.json"
+    while True:
+        data = zd_request("GET", path, params=params)
+        out.extend(data.get("groups", []))
+        next_page = data.get("next_page")
+        if not next_page:
+            break
+        path = _zd_path_from_url_or_path(next_page)
+        params = None
+    return out
+
+
 # --------------------------------------------------------------------------
 # 担当割り当て: 名簿・輪番状態・担当者フィールド書込
 # --------------------------------------------------------------------------
@@ -521,6 +544,38 @@ def _agent_lookup(light_agents: List[Dict[str, Any]]) -> Dict[str, int]:
     return lookup
 
 
+def _group_snapshot(group: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "id": int(group["id"]),
+        "name": group.get("name") or str(group["id"]),
+    }
+
+
+def resolve_special_group(groups: Optional[List[Dict[str, Any]]] = None) -> Tuple[Optional[Dict[str, Any]], List[str]]:
+    """SPECIAL group を env id または group name から解決する。"""
+    errors: List[str] = []
+    if SPECIAL_GROUP_ID_ENV:
+        try:
+            return {"id": int(SPECIAL_GROUP_ID_ENV), "name": SPECIAL_GROUP_NAME or "SPECIAL"}, errors
+        except ValueError:
+            errors.append("SUPPORT_AI_SPECIAL_GROUP_ID must be an integer")
+            return None, errors
+    if not SPECIAL_GROUP_NAME:
+        errors.append("SUPPORT_AI_SPECIAL_GROUP_NAME is empty")
+        return None, errors
+    if groups is None:
+        groups = list_groups()
+    matches = [
+        _group_snapshot(group)
+        for group in groups
+        if _norm_name(group.get("name")) == _norm_name(SPECIAL_GROUP_NAME)
+    ]
+    if len(matches) != 1:
+        errors.append(f"SPECIAL group name {SPECIAL_GROUP_NAME!r} must match exactly one Zendesk group; found {len(matches)}")
+        return None, errors
+    return matches[0], errors
+
+
 def resolve_escalation_map(raw_map: Dict[str, Any], light_agents: List[Dict[str, Any]]) -> Tuple[Dict[str, Any], List[str]]:
     """人名/email/id 混在の escalation_map を Zendesk user id に解決する。"""
     lookup = _agent_lookup(light_agents)
@@ -561,12 +616,18 @@ def load_agents_config(*, refresh: bool = False) -> Dict[str, Any]:
     global _agents_cache
     if _agents_cache is not None and not refresh:
         return _agents_cache
-    cfg: Dict[str, Any] = {"assignee_field_id": None, "light_agents": [], "escalation_map": {}}
+    cfg: Dict[str, Any] = {
+        "assignee_field_id": None,
+        "light_agents": [],
+        "assignment_pools": {},
+        "escalation_map": {},
+    }
     try:
         if AGENTS_FILE.exists():
             loaded = read_json(AGENTS_FILE)
             cfg["assignee_field_id"] = ASSIGNEE_FIELD_ID_ENV or loaded.get("assignee_field_id")
             cfg["light_agents"] = loaded.get("light_agents") or []
+            cfg["assignment_pools"] = loaded.get("assignment_pools") or {}
             raw_map = loaded.get("escalation_map") or {}
             cfg["escalation_map_raw"] = raw_map
             cfg["escalation_map"], errors = resolve_escalation_map(raw_map, cfg["light_agents"])
@@ -580,24 +641,90 @@ def load_agents_config(*, refresh: bool = False) -> Dict[str, Any]:
     return cfg
 
 
-def fetch_light_agents() -> List[Dict[str, Any]]:
+def _user_tags(user: Dict[str, Any]) -> List[str]:
+    return sorted(str(tag).strip() for tag in (user.get("tags") or []) if str(tag).strip())
+
+
+def _agent_snapshot(user: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "id": int(user["id"]),
+        "name": user.get("name") or str(user["id"]),
+        "email": user.get("email"),
+        "alias": user.get("alias"),
+        "role_type": user.get("role_type"),
+        "tags": _user_tags(user),
+    }
+
+
+def fetch_light_agents(users: Optional[List[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
     """Zendesk から現在のライトエージェント一覧を取得する。"""
-    users = list_users(role="agent")
+    if users is None:
+        users = list_users(role="agent")
     agents: List[Dict[str, Any]] = []
     for user in users:
         if user.get("role_type") != LIGHT_AGENT_ROLE_TYPE:
             continue
         if not INCLUDE_SUSPENDED_AGENTS and user.get("suspended"):
             continue
-        agents.append({
-            "id": int(user["id"]),
-            "name": user.get("name") or str(user["id"]),
-            "email": user.get("email"),
-            "alias": user.get("alias"),
-            "role_type": user.get("role_type"),
-        })
+        agents.append(_agent_snapshot(user))
     agents.sort(key=lambda a: (_norm_name(a.get("name")), int(a["id"])))
     return agents
+
+
+def build_special_assignment_pool(
+    users: List[Dict[str, Any]],
+    light_agents: List[Dict[str, Any]],
+    *,
+    group: Optional[Dict[str, Any]] = None,
+) -> Tuple[Dict[str, Any], List[str]]:
+    """special_support タグから SPECIAL 標準担当者とライト担当プールを構成する。"""
+    errors: List[str] = []
+    tag = SPECIAL_AGENT_TAG
+    tagged_users = [
+        user for user in users
+        if tag in _user_tags(user) and (INCLUDE_SUSPENDED_AGENTS or not user.get("suspended"))
+    ]
+    light_ids = {int(a["id"]) for a in light_agents if "id" in a}
+    primary_candidates = [
+        _agent_snapshot(user)
+        for user in tagged_users
+        if int(user.get("id")) not in light_ids
+    ]
+    special_light_agents = [
+        agent for agent in light_agents
+        if tag in (agent.get("tags") or [])
+    ]
+    if len(primary_candidates) != 1:
+        errors.append(f"SPECIAL primary agent must be exactly one tagged non-light agent; found {len(primary_candidates)}")
+    if not special_light_agents:
+        errors.append("SPECIAL light agent pool is empty")
+    return {
+        "tag": tag,
+        "group": group,
+        "primary_agent": primary_candidates[0] if len(primary_candidates) == 1 else None,
+        "light_agents": special_light_agents,
+    }, errors
+
+
+def build_single_agent_pool(
+    users: List[Dict[str, Any]],
+    *,
+    tag: str,
+    pool_name: str,
+) -> Tuple[Dict[str, Any], List[str]]:
+    """指定 tag から単一標準担当者 pool を構成する。"""
+    errors: List[str] = []
+    tagged_users = [
+        _agent_snapshot(user)
+        for user in users
+        if tag in _user_tags(user) and (INCLUDE_SUSPENDED_AGENTS or not user.get("suspended"))
+    ]
+    if len(tagged_users) != 1:
+        errors.append(f"{pool_name} primary agent must be exactly one tagged active agent; found {len(tagged_users)}")
+    return {
+        "tag": tag,
+        "primary_agent": tagged_users[0] if len(tagged_users) == 1 else None,
+    }, errors
 
 
 def sync_agents_config(*, dry_run: bool = False) -> Dict[str, Any]:
@@ -613,12 +740,39 @@ def sync_agents_config(*, dry_run: bool = False) -> Dict[str, Any]:
     if ASSIGNEE_FIELD_ID_ENV:
         loaded["assignee_field_id"] = ASSIGNEE_FIELD_ID_ENV
     loaded.setdefault("escalation_map", {})
-    loaded["light_agents"] = fetch_light_agents()
+    users = list_users(role="agent")
+    group, group_errors = resolve_special_group()
+    loaded["light_agents"] = fetch_light_agents(users)
+    special_pool, special_errors = build_special_assignment_pool(users, loaded["light_agents"], group=group)
+    special_errors.extend(group_errors)
+    passkey_pool, passkey_errors = build_single_agent_pool(
+        users,
+        tag=PASSKEY_AGENT_TAG,
+        pool_name="passkey",
+    )
+    pools = loaded.get("assignment_pools") or {}
+    pools[SPECIAL_SUPPORT_AREA] = special_pool
+    pools[PASSKEY_SUPPORT_AREA] = passkey_pool
+    loaded["assignment_pools"] = pools
     resolved, errors = resolve_escalation_map(loaded.get("escalation_map") or {}, loaded["light_agents"])
     loaded["_sync"] = {
         "source": "zendesk",
         "synced_at": int(time.time()),
         "light_agent_count": len(loaded["light_agents"]),
+        "assignment_pools": {
+            SPECIAL_SUPPORT_AREA: {
+                "tag": SPECIAL_AGENT_TAG,
+                "group_configured": bool(special_pool.get("group")),
+                "primary_agent_configured": bool(special_pool.get("primary_agent")),
+                "light_agent_count": len(special_pool.get("light_agents") or []),
+                "errors": special_errors,
+            },
+            PASSKEY_SUPPORT_AREA: {
+                "tag": PASSKEY_AGENT_TAG,
+                "primary_agent_configured": bool(passkey_pool.get("primary_agent")),
+                "errors": passkey_errors,
+            },
+        },
         "unresolved_escalations": errors,
     }
     if not dry_run:
@@ -629,6 +783,8 @@ def sync_agents_config(*, dry_run: bool = False) -> Dict[str, Any]:
         "light_agents": loaded["light_agents"],
         "escalation_map": resolved,
         "escalation_map_raw": loaded.get("escalation_map") or {},
+        "assignment_pools": loaded.get("assignment_pools") or {},
+        "assignment_pool_errors": special_errors + passkey_errors,
         "escalation_errors": errors,
     }
 
@@ -639,30 +795,41 @@ def light_agent_ids() -> set:
 
 
 def agent_name(agent_id: int) -> str:
-    for a in load_agents_config().get("light_agents", []):
+    cfg = load_agents_config()
+    agents = list(cfg.get("light_agents", []))
+    for pool in (cfg.get("assignment_pools") or {}).values():
+        if isinstance(pool, dict):
+            primary = pool.get("primary_agent")
+            if isinstance(primary, dict):
+                agents.append(primary)
+            agents.extend(pool.get("light_agents") or [])
+    for a in agents:
         if a.get("id") == agent_id:
             return a.get("name", str(agent_id))
     return str(agent_id)
 
 
-def _roundrobin_path(base: Optional[Path] = None) -> Path:
+def _roundrobin_path(base: Optional[Path] = None, *, pool: str = "default") -> Path:
     base = Path(base) if base is not None else SPOOL_DIR
-    return base / "state" / "roundrobin.json"
+    if pool == "default":
+        return base / "state" / "roundrobin.json"
+    safe_pool = "".join(ch if ch.isalnum() or ch in ("_", "-") else "_" for ch in pool)
+    return base / "state" / f"roundrobin_{safe_pool}.json"
 
 
-def read_roundrobin(*, base: Optional[Path] = None) -> int:
+def read_roundrobin(*, base: Optional[Path] = None, pool: str = "default") -> int:
     """輪番カーソルを読む。未初期化なら 0。"""
-    p = _roundrobin_path(base)
+    p = _roundrobin_path(base, pool=pool)
     try:
         return int(read_json(p).get("cursor", 0))
     except Exception:  # noqa: BLE001
         return 0
 
 
-def write_roundrobin(cursor: int, *, base: Optional[Path] = None) -> None:
+def write_roundrobin(cursor: int, *, base: Optional[Path] = None, pool: str = "default") -> None:
     """輪番カーソルを atomic に書く(tmp→rename)。"""
     base = Path(base) if base is not None else SPOOL_DIR
-    atomic_write_json(_roundrobin_path(base), {"cursor": int(cursor)}, base=base)
+    atomic_write_json(_roundrobin_path(base, pool=pool), {"cursor": int(cursor)}, base=base)
 
 
 def set_assignee_field(ticket_id: int, agent_id: int) -> Dict[str, Any]:
@@ -679,6 +846,21 @@ def set_assignee_field(ticket_id: int, agent_id: int) -> Dict[str, Any]:
     return zd_request(
         "PUT", f"/api/v2/tickets/{ticket_id}.json",
         json_body={"ticket": {"custom_fields": [{"id": field_id, "value": agent_id}]}},
+    )
+
+
+def set_ticket_assignee(ticket_id: int, agent_id: int, *, group_id: Optional[int] = None) -> Dict[str, Any]:
+    """Zendesk 標準担当者と任意の group をセットする。
+
+    通常 triage では使わない。SPECIAL チームの標準担当者をタグ同期から一意に
+    決められた場合だけ呼び出す。group_id があれば同じ update で設定する。
+    """
+    ticket: Dict[str, Any] = {"assignee_id": agent_id}
+    if group_id is not None:
+        ticket["group_id"] = group_id
+    return zd_request(
+        "PUT", f"/api/v2/tickets/{ticket_id}.json",
+        json_body={"ticket": ticket},
     )
 
 

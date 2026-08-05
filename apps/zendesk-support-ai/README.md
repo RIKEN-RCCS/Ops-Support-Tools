@@ -30,6 +30,7 @@ Zendesk の新規チケット一次トリアージ、追加質問への返信ド
 - 例外として、`/zendesk/webhook/send_internal_note` は人間が作った最新社内メモを AI なしで公開返信へ転送します。
 - AI は担当者 ID を出しません。担当者は `agents.json` と決定論的ロジックで選びます。
 - ラウンドロビン対象の `light_agents` は Zendesk から同期します。
+- triage AI はチケット本文から SPECIAL / passkey 関連かどうかも判定します。SPECIAL チケットだけは例外として、Zendesk group `SPECIAL` と user tag `special_support` から同期した標準担当者へ ticket group/assignee を設定し、SPECIAL 用 light agent pool から「対応担当」をラウンドロビンします。passkey チケットは user tag `authentication_support` から同期した単一担当者へ ticket assignee を設定します。
 - `config/agents.json`、`.env`、`secrets/`、`spool/` は Git に入れない前提です。
 - 本番 Docker では秘密値を `.env` / `env_file` で渡さず、Docker secrets ファイルとして渡します。
 
@@ -44,6 +45,7 @@ Zendesk の新規チケット一次トリアージ、追加質問への返信ド
 | `SUPPORT_AI_TRIAGE_TAG` | 投稿済み判定に使う Zendesk tag |
 | `SUPPORT_AI_TRIAGE_SEARCH_QUERY` | polling 用 Zendesk Search query |
 | `SUPPORT_AI_KNOWLEDGE_API_URL` | Knowledge API の内部URL。設定時、環境確認が必要なtriageをinvestigation caseへ送る |
+| `SUPPORT_AI_KNOWLEDGE_PUBLIC_URL` | Zendesk短縮メモに載せるKnowledge公開URL。例 `https://support.example.com` |
 | `SUPPORT_AI_CREATE_KNOWLEDGE_RUNS` | `requires_runbook` / `requires_environment_knowledge` のtriageでKnowledge上のinvestigation caseを作る |
 | `SUPPORT_AI_RUNBOOK_WORKER_ENABLED` | `status=requested` の real-machine investigation task から runbook plan を生成する worker を有効化 |
 | `SUPPORT_AI_RUNBOOK_REVIEW_WORKER_ENABLED` | runbook plan の risk / technical / chief 評価 worker を有効化 |
@@ -63,6 +65,9 @@ Zendesk の新規チケット一次トリアージ、追加質問への返信ド
 | `SUPPORT_AI_RUNBOOK_MODEL` | real-machine runbook生成・実行結果整理向けの強めのモデル。未設定なら `SUPPORT_AI_MODEL` を使う |
 | `SUPPORT_AI_RUNBOOK_FALLBACK_MODELS` | real-machine runbook向けフォールバックモデル。カンマ区切り |
 | `SUPPORT_AI_CONTEXT` | LLM に渡すサポート対象の説明 |
+| `SUPPORT_AI_ASKDONA_MCP_URL` | AskDona MCP RAG endpoint。Docker Compose 既定は `https://api.askdona.com/api/mcp` |
+| `SUPPORT_AI_ASKDONA_MCP_TOKEN` / `SUPPORT_AI_ASKDONA_MCP_TOKEN_FILE` | AskDona MCP endpoint の Bearer token。Docker では `secrets/support_ai_askdona_mcp_token` を使う |
+| `SUPPORT_AI_ASKDONA_MCP_TOOL` | AskDona MCP の検索tool名を明示したい場合に設定。未設定なら `tools/list` から search/query/retrieve/ask 系を選ぶ |
 | `SUPPORT_AI_ENVIRONMENT_CANDIDATES` | triage AI が本文から推定してよい environment 候補。カンマ区切り |
 | `SUPPORT_AI_MACHINE_CANDIDATES` | triage AI が本文から推定してよい machine 候補。カンマ区切り |
 | `SUPPORT_AI_MACHINE_ALIAS_MAP` | machine の一意な表記ゆれを canonical 名へ正規化する JSON map |
@@ -76,11 +81,25 @@ Zendesk の新規チケット一次トリアージ、追加質問への返信ド
 | `SUPPORT_AI_SYNC_AGENTS_ON_POST` | `poster.py` 実行時に Zendesk から `light_agents` を同期する |
 | `SUPPORT_AI_LIGHT_AGENT_ROLE_TYPE` | light agent 判定に使う Zendesk `role_type`。既定 `1` |
 | `SUPPORT_AI_ASSIGNEE_FIELD_ID` | Zendesk の「対応担当」ticket custom field id。未設定だと担当者フィールドを書き込まない |
+| `SUPPORT_AI_SPECIAL_SUPPORT_AREA` | SPECIAL 用 support area 値。既定 `special` |
+| `SUPPORT_AI_SPECIAL_AGENT_TAG` | SPECIAL チーム判定に使う Zendesk user tag。既定 `special_support` |
+| `SUPPORT_AI_SPECIAL_GROUP_NAME` | SPECIAL チケットへ設定する Zendesk group 名。既定 `SPECIAL` |
+| `SUPPORT_AI_SPECIAL_GROUP_ID` | SPECIAL group id を明示する場合に設定。未設定なら `SUPPORT_AI_SPECIAL_GROUP_NAME` で同期時に解決 |
+| `SUPPORT_AI_PASSKEY_SUPPORT_AREA` | passkey 用 support area 値。既定 `passkey` |
+| `SUPPORT_AI_PASSKEY_AGENT_TAG` | passkey 担当者判定に使う Zendesk user tag。既定 `authentication_support` |
 | `SUPPORT_AI_LLM_HEALTHCHECK_PATH` | LLM 疎通確認 endpoint。既定 `/models` |
 
 `SUPPORT_AI_ASSIGNEE_FIELD_ID` は担当者自動設定に必須です。Zendesk の管理画面で対象の ticket custom field id を確認し、環境ごとの `.env` に設定してください。
 
-担当者フィールドを使う場合は `agents.example.json` を `agents.json` にコピーし、Zendesk の ticket custom field id を `assignee_field_id` に設定します。`light_agents` は `sync_agents.py` または `poster.py` が Zendesk から更新します。
+担当者フィールドを使う場合は `agents.example.json` を `agents.json` にコピーし、Zendesk の ticket custom field id を `assignee_field_id` に設定します。`light_agents` と `assignment_pools` は `sync_agents.py` または `poster.py` が Zendesk から更新します。
+
+SPECIAL チームは Zendesk group と user tag で管理します。既定では Zendesk group 名 `SPECIAL` を ticket group、`special_support` が付いた非 light agent 1 名を ticket の標準担当者、同じ tag が付いた light agent を SPECIAL 用「対応担当」ラウンドロビン対象にします。SPECIAL 用 pool が不完全な場合、通常 light agent pool へはフォールバックせず、割当警告を社内メモへ残します。group 名で一意に解決できない環境では `SUPPORT_AI_SPECIAL_GROUP_ID` を設定します。
+
+SPECIAL チケットかどうかは、Zendesk から送られた ticket id を元に取得した件名・本文を triage AI が読み、`support_area=special` かつ高確信の場合だけ採用します。単に AI、GPU、CUDA、MPI、スパコン等の一般的な問い合わせであるだけでは SPECIAL 扱いにしません。
+
+Deployment-specific routing rules belong in private configuration.
+
+Zendesk に投稿するAI社内メモは、サポート担当者の作業画面を邪魔しないよう最小限にします。詳細な triage 内容、回答ゲート、runbook/Knowledge 情報は pending payload と Knowledge 側に残します。Knowledge の run view が運用上十分に見やすくなるまでは、社内メモには Knowledge リンクを載せません。
 
 `escalation_map` は user id ではなく人名または email で書けます。値は単一値またはリストにできます。
 
@@ -168,6 +187,12 @@ Zendesk trigger 側で対象環境や machine を判定できる場合は、次�
 
 ```json
 {"ticket_id": 12345, "environment": "production", "machine": "target-host-01"}
+```
+
+通常は Zendesk trigger payload は `ticket_id` だけで十分です。運用上どうしても Zendesk trigger 側で上書きしたい場合だけ、payload に `support_area` を含められます。この明示値は triage AI の本文判定より優先されます。
+
+```json
+{"ticket_id": 12345, "support_area": "special"}
 ```
 
 Zendesk 側で送れない場合、triage AI は `SUPPORT_AI_ENVIRONMENT_CANDIDATES` / `SUPPORT_AI_MACHINE_CANDIDATES` の候補内から本文で高確信に特定できるものだけを採用します。候補が複数あり迷う場合や本文根拠が弱い場合は metadata を空にし、公開返信は保留して対象環境を確認する質問を出します。
@@ -306,9 +331,10 @@ DBにある情報は未来永劫の真実ではありません。古いドライ
 
 1. 現在の Knowledge API DB を metadata search で検索し、候補document本文をAPIプロセス経由で復号取得する。
 2. `SUPPORT_AI_RAG_SEARCH_URL` が設定されていれば、外部RAG DBへ `q` / `limit` で問い合わせる。
-3. `SUPPORT_AI_WEB_SEARCH_URL` が設定されていれば、許可されたweb searchサービスへ `q` / `limit` で問い合わせる。
+3. `SUPPORT_AI_ASKDONA_MCP_URL` が設定されていれば、AskDona MCP endpoint の `tools/list` から検索系toolを選び、`tools/call` で問い合わせる。
+4. `SUPPORT_AI_WEB_SEARCH_URL` が設定されていれば、許可されたweb searchサービスへ `q` / `limit` で問い合わせる。
 
-worker は `knowledge-research-result` document を添付し、`reusable_findings`、古い/条件不明の候補、RAG/Webの利用可否、不足証拠、次にfresh checkや方針確認が必要かを記録します。RAG DB と web search は未設定なら実行せず、結果documentに `not_configured` として残します。API key が必要な検索サービスを使う場合は、`.env` ではなく `SUPPORT_AI_RAG_API_KEY_FILE` / `SUPPORT_AI_WEB_SEARCH_API_KEY_FILE` 相当のsecret経由で渡してください。
+worker は `knowledge-research-result` document を添付し、`reusable_findings`、古い/条件不明の候補、RAG/MCP/Webの利用可否、不足証拠、次にfresh checkや方針確認が必要かを記録します。RAG DB、AskDona MCP、web search は未設定なら実行せず、結果documentに `not_configured` として残します。API key や token が必要な検索サービスを使う場合は、`.env` ではなく `SUPPORT_AI_RAG_API_KEY_FILE` / `SUPPORT_AI_ASKDONA_MCP_TOKEN_FILE` / `SUPPORT_AI_WEB_SEARCH_API_KEY_FILE` 相当のsecret経由で渡してください。
 
 再利用性と再現性は別物として扱います。過去の知見は、似た質問への初期仮説や調査短縮には有用ですが、それだけで現在の環境に再現するとは限りません。answer synthesis や router は、過去知見を次のように分類して扱います。
 

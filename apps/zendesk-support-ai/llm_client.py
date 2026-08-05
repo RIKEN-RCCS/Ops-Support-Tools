@@ -67,6 +67,7 @@ MACHINE_CANDIDATES = target_normalizer.machine_candidates()
 MACHINE_ALIAS_GUIDE = target_normalizer.machine_alias_guide()
 TARGET_CONFIDENCES = ["none", "low", "medium", "high"]
 TARGET_RESOLUTIONS = ["identified_from_text", "ask_user", "operator_select", "runbook_identify", "unknown_stop"]
+SUPPORT_AREAS = ["general", "special", "passkey"]
 
 # トリアージ出力スキーマ。業務上の優先度はAI判断から外すため severity は出させない。
 SUPPORT_AI_TRIAGE_SCHEMA: Dict[str, Any] = {
@@ -75,6 +76,20 @@ SUPPORT_AI_TRIAGE_SCHEMA: Dict[str, Any] = {
         "summary": {"type": "string", "description": "問題の要約(日本語)"},
         "probable_cause": {"type": "string", "description": "推定原因(日本語)"},
         "category": {"type": "string", "enum": CATEGORIES},
+        "support_area": {
+            "type": "string",
+            "enum": SUPPORT_AREAS,
+            "description": "SPECIAL関連なら special、パスキー関連なら passkey、それ以外は general。担当者割当に使うため不確かな場合は general",
+        },
+        "support_area_confidence": {
+            "type": "string",
+            "enum": TARGET_CONFIDENCES,
+            "description": "support_area 判定の確信度。不明または根拠が弱い場合は low/none",
+        },
+        "support_area_reason": {
+            "type": "string",
+            "description": "support_area 判定の根拠。special/passkey と判断した語句・文脈、またはgeneralに倒した理由",
+        },
         "difficulty": {
             "type": "string", "enum": DIFFICULTIES,
             "description": "対応難易度。専門知識や深い調査が要りそうなら high",
@@ -132,6 +147,7 @@ SUPPORT_AI_TRIAGE_SCHEMA: Dict[str, Any] = {
     },
     "required": [
         "summary", "probable_cause", "category", "difficulty",
+        "support_area", "support_area_confidence", "support_area_reason",
         "clarifying_questions", "draft_reply",
         "requires_environment_knowledge", "requires_runbook", "requires_operator_check",
         "safe_to_reply_to_user", "answer_confidence", "suggested_next_action",
@@ -754,8 +770,7 @@ def triage(masked_subject: str, masked_body: str, *, model: Optional[str] = None
         "個人情報は [EMAIL_1] のようなプレースホルダで伏せられています。"
         "プレースホルダはそのまま保持し、新しいプレースホルダを創作しないでください。"
         "category と difficulty は必ず指定された enum から選んでください。"
-        "緊急度・優先度・重要度は判断しないでください。"
-        "それらは技術内容だけでなく業務上の要因を含むため、この一次トリアージAIの責務外です。"
+        "担当分類は非公開の設置先設定で指定します。"
         f"category の判断基準: {CATEGORY_GUIDE}。"
         "difficulty は、専門外のスタッフが AI 補助で一次対応できそうなら low/normal、"
         "専門知識や深い調査が要りそうなら high と判断してください。"

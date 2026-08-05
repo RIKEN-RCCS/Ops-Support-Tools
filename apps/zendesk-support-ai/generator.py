@@ -199,6 +199,17 @@ def _resolved_target(event: dict, triage: dict) -> tuple[str, str, str, str]:
     )
 
 
+def _resolved_support_area(event: dict, triage: dict) -> tuple[str, str, str]:
+    explicit = str(event.get("support_area") or "").strip().lower()
+    if explicit:
+        return explicit, "identified_from_webhook", "Zendesk webhook payload に support_area が含まれていたため。"
+    area = str(triage.get("support_area") or "general").strip().lower()
+    confidence = str(triage.get("support_area_confidence") or "none").strip().lower()
+    if area in {"special", "passkey"} and confidence == "high":
+        return area, "identified_from_text", str(triage.get("support_area_reason") or "")
+    return "general", "default_general", str(triage.get("support_area_reason") or "")
+
+
 def _create_knowledge_run(ticket_id: int, triage: dict, *, environment: str = "", machine: str = "") -> tuple[str | None, str | None, str, str]:
     if not CREATE_KNOWLEDGE_RUNS or not common.knowledge_enabled():
         return None, None, "no_runbook_needed", "none"
@@ -252,7 +263,7 @@ def _create_knowledge_run(ticket_id: int, triage: dict, *, environment: str = ""
 def _build_note_body(triage: dict, model: str, *, knowledge_run_id: str | None = None,
                      knowledge_run_error: str | None = None, investigation_decision: str = "",
                      case_change: str = "") -> str:
-    """トリアージ結果から社内メモ本文を組み立てる(プレースホルダは残したまま)。"""
+    """トリアージ結果から詳細メモ本文を組み立てる(プレースホルダは残したまま)。"""
     qs = triage.get("clarifying_questions") or []
     q_lines = "\n".join(f"- {q}" for q in qs) if qs else "- (なし)"
     safe_to_reply = bool(triage.get("safe_to_reply_to_user"))
@@ -288,6 +299,9 @@ def _build_note_body(triage: dict, model: str, *, knowledge_run_id: str | None =
         f"- requires_runbook: {_yesno(triage.get('requires_runbook'))}\n"
         f"- requires_operator_check: {_yesno(triage.get('requires_operator_check'))}\n"
         f"- suggested_next_action: {triage.get('suggested_next_action', '').strip()}\n"
+        f"- support_area: {triage.get('support_area', 'general')} "
+        f"({triage.get('support_area_confidence', '')}; {triage.get('support_area_resolution', '')})\n"
+        f"- support_area_reason: {triage.get('support_area_reason', '').strip()}\n"
         f"- target_resolution: {triage.get('target_resolution', '')}\n"
         f"- target_resolution_reason: {triage.get('target_resolution_reason', '')}\n"
         f"- environment: {triage.get('environment', '')} ({triage.get('environment_confidence', '')})\n"
@@ -302,6 +316,23 @@ def _build_note_body(triage: dict, model: str, *, knowledge_run_id: str | None =
         f"※ このメモは {model} により自動生成されました。"
         "緊急度・優先度は判断対象外です。難易度は参考情報です。アサイン・返信は人間が判断してください。"
     )
+
+
+def _build_short_note_body(triage: dict, model: str, *, knowledge_run_id: str | None = None,
+                           knowledge_run_error: str | None = None,
+                           investigation_decision: str = "") -> str:
+    """Zendesk画面に出す最小限の社内メモ。"""
+    area = triage.get("support_area", "general")
+    category = triage.get("category", "other")
+    confidence = triage.get("answer_confidence", "low")
+    if area in {"special", "passkey"}:
+        header = f"🤖 AI一次トリアージ: {area} / confidence={confidence}"
+    else:
+        header = f"🤖 AI一次トリアージ: {area} / {category} / confidence={confidence}"
+    return "\n".join([
+        header,
+        f"model: {model}",
+    ])
 
 
 def process_one(path, verbose: bool = False) -> bool:
@@ -328,10 +359,14 @@ def process_one(path, verbose: bool = False) -> bool:
         triage = llm_client.triage(masked_subject, masked_body)
         model = triage.get("_model", "unknown")
         environment, machine, target_resolution, target_resolution_reason = _resolved_target(event, triage)
+        support_area, support_area_resolution, support_area_reason = _resolved_support_area(event, triage)
         triage["environment"] = environment
         triage["machine"] = machine
         triage["target_resolution"] = target_resolution
         triage["target_resolution_reason"] = target_resolution_reason
+        triage["support_area"] = support_area
+        triage["support_area_resolution"] = support_area_resolution
+        triage["support_area_reason"] = support_area_reason
         knowledge_run_id, knowledge_run_error, investigation_decision, case_change = _create_knowledge_run(
             ticket_id,
             triage,
@@ -341,9 +376,21 @@ def process_one(path, verbose: bool = False) -> bool:
         if knowledge_run_error and verbose:
             common.log(f"knowledge run create failed ticket_{ticket_id}: {knowledge_run_error}")
 
+        detail_body = _build_note_body(
+            triage,
+            model,
+            knowledge_run_id=knowledge_run_id,
+            knowledge_run_error=knowledge_run_error,
+            investigation_decision=investigation_decision,
+            case_change=case_change,
+        )
         record = {
             "ticket_id": ticket_id,
             "generated_at": int(time.time()),
+            "support_area": support_area,
+            "support_area_confidence": triage.get("support_area_confidence"),
+            "support_area_resolution": support_area_resolution,
+            "support_area_reason": support_area_reason,
             "model": model,
             "severity": "not_assessed",
             "category": triage["category"],
@@ -363,13 +410,13 @@ def process_one(path, verbose: bool = False) -> bool:
             "knowledge_run_id": knowledge_run_id,
             "investigation_decision": investigation_decision,
             "case_change": case_change,
-            "note_body": _build_note_body(
+            "triage_detail_body": detail_body,
+            "note_body": _build_short_note_body(
                 triage,
                 model,
                 knowledge_run_id=knowledge_run_id,
                 knowledge_run_error=knowledge_run_error,
                 investigation_decision=investigation_decision,
-                case_change=case_change,
             ),
             "mask_mapping": mapping,  # ローカル保持のみ。LLM にも外部にも送らない
         }

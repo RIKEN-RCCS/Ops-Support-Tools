@@ -159,8 +159,16 @@ services:
     env_file:
       - path: ./apps/zendesk-support-ai/.env
         required: false
-    environment: *support-secret-env
-    secrets: *support-secrets
+    environment:
+      <<: *support-secret-env
+      SUPPORT_AI_ASKDONA_MCP_URL: ${SUPPORT_AI_ASKDONA_MCP_URL:-https://api.askdona.com/api/mcp}
+      SUPPORT_AI_ASKDONA_MCP_TOKEN_FILE: /run/secrets/support_ai_askdona_mcp_token
+    secrets:
+      - llm_api_key
+      - zendesk_rccs_relay_token
+      - support_ai_webhook_token
+      - support_ai_queue_key
+      - support_ai_askdona_mcp_token
     volumes:
       - ./apps/zendesk-support-ai/data:/data/queue
       - ./apps/zendesk-support-ai/config:/config
@@ -267,6 +275,8 @@ secrets:
     file: ./apps/zendesk-support-ai/secrets/support_ai_webhook_token
   support_ai_queue_key:
     file: ./apps/zendesk-support-ai/secrets/support_ai_queue_key
+  support_ai_askdona_mcp_token:
+    file: ./apps/zendesk-support-ai/secrets/support_ai_askdona_mcp_token
   knowledge_field_key:
     file: ./apps/knowledge-api/secrets/knowledge_field_key
   knowledge_api_write_token:

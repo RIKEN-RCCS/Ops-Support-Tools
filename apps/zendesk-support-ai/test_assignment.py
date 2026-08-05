@@ -69,6 +69,63 @@ def test_empty_roster_returns_none():
     assert aid is None and nc == 0
 
 
+def test_special_pool_builder_splits_primary_and_light_agents_by_tag():
+    users = [
+        {"id": 900, "name": "Primary", "role_type": None, "tags": ["special_support"]},
+        {"id": 901, "name": "Light A", "role_type": 1, "tags": ["special_support"]},
+        {"id": 902, "name": "Light B", "role_type": 1, "tags": ["special_support"]},
+        {"id": 903, "name": "Other", "role_type": 1, "tags": []},
+    ]
+    light_agents = common.fetch_light_agents(users)
+    pool, errors = common.build_special_assignment_pool(users, light_agents, group={"id": 800, "name": "SPECIAL"})
+    assert errors == []
+    assert pool["group"]["id"] == 800
+    assert pool["primary_agent"]["id"] == 900
+    assert [a["id"] for a in pool["light_agents"]] == [901, 902]
+
+
+def test_special_assignment_uses_separate_light_pool_cursor():
+    pool = {
+        "primary_agent": {"id": 900, "name": "Primary"},
+        "group": {"id": 800, "name": "SPECIAL"},
+        "light_agents": [{"id": 901, "name": "Light A"}, {"id": 902, "name": "Light B"}],
+    }
+    primary_id, group_id, light_id, new_cursor, errors = poster.resolve_special_assignment(cursor=1, assignment_pool=pool)
+    assert errors == []
+    assert (primary_id, group_id, light_id, new_cursor) == (900, 800, 902, 2)
+
+
+def test_special_assignment_does_not_fallback_to_default_pool():
+    primary_id, group_id, light_id, new_cursor, errors = poster.resolve_special_assignment(
+        cursor=5,
+        assignment_pool={"primary_agent": None, "group": None, "light_agents": []},
+    )
+    assert primary_id is None and group_id is None and light_id is None and new_cursor == 5
+    assert len(errors) == 3
+
+
+def test_single_agent_pool_requires_one_tagged_agent():
+    users = [
+        {"id": 910, "name": "Passkey Owner", "role_type": None, "tags": ["authentication_support"]},
+        {"id": 911, "name": "Other", "role_type": 1, "tags": []},
+    ]
+    pool, errors = common.build_single_agent_pool(users, tag="authentication_support", pool_name="passkey")
+    assert errors == []
+    assert pool["primary_agent"]["id"] == 910
+    aid, errors = poster.resolve_single_agent_assignment(assignment_pool=pool, label="passkey")
+    assert aid == 910 and errors == []
+
+
+def test_single_agent_pool_rejects_multiple_tagged_agents():
+    users = [
+        {"id": 910, "name": "Passkey Owner A", "role_type": None, "tags": ["authentication_support"]},
+        {"id": 911, "name": "Passkey Owner B", "role_type": None, "tags": ["authentication_support"]},
+    ]
+    pool, errors = common.build_single_agent_pool(users, tag="authentication_support", pool_name="passkey")
+    assert pool["primary_agent"] is None
+    assert errors and "exactly one" in errors[0]
+
+
 def test_validate_rejects_bad_difficulty():
     base = {"ticket_id": 1, "severity": "not_assessed", "category": "other",
             "difficulty": "URGENT", "answer_confidence": "low",

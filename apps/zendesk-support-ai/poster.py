@@ -6,8 +6,8 @@ pending/ を消費 → スキーマ検証 → unmask → 社内メモ投稿(publ
 検証 NG / 捏造プレースホルダは failed/ へ。
 
 Zendesk 書き込みトークンを持つのはこのプロセスだけ(実運用では書込ユーザーで動かす)。
-書き込み操作は (1) 内部メモ追記+タグ、(2) カスタムフィールド「担当者」セット のみ
-。assignee 変更・クローズ・公開返信は行わない。
+書き込み操作は (1) 内部メモ追記+タグ、(2) カスタムフィールド「担当者」セット、
+(3) SPECIAL/passkey チケット限定の標準 assignee セットのみ。クローズ・公開返信は行わない。
 
 担当割り当て: AI は category/difficulty のみ出し、担当者 ID は
 コードが決定論的に決める(injection で担当を操作される経路を作らない)。
@@ -87,6 +87,41 @@ def resolve_assignee(
     return aid, new_cursor, "roundrobin"
 
 
+def resolve_special_assignment(*, cursor: int, assignment_pool: dict) -> Tuple[Optional[int], Optional[int], Optional[int], int, list[str]]:
+    """SPECIAL チケット用の標準担当者、group、対応担当ライトエージェントを選ぶ。
+
+    返り値: (primary_agent_id|None, group_id|None, light_agent_id|None, new_cursor, errors)。
+    SPECIAL は通常プールへフォールバックしない。名簿が不完全なら割当をスキップして
+    社内メモに警告を残す。
+    """
+    errors: list[str] = []
+    primary = assignment_pool.get("primary_agent") if isinstance(assignment_pool, dict) else None
+    group = assignment_pool.get("group") if isinstance(assignment_pool, dict) else None
+    light_agents = assignment_pool.get("light_agents") if isinstance(assignment_pool, dict) else None
+    light_agents = light_agents or []
+    primary_id = primary.get("id") if isinstance(primary, dict) else None
+    group_id = group.get("id") if isinstance(group, dict) else None
+    if primary_id is None:
+        errors.append("SPECIAL 標準担当者が一意に同期されていません")
+    if group_id is None:
+        errors.append("SPECIAL グループが一意に同期されていません")
+    if not light_agents:
+        errors.append("SPECIAL 対応担当ライトエージェントが同期されていません")
+        return primary_id, group_id, None, cursor, errors
+    light_agent = light_agents[cursor % len(light_agents)]
+    return primary_id, group_id, light_agent.get("id"), cursor + 1, errors
+
+
+def resolve_single_agent_assignment(*, assignment_pool: dict, label: str) -> Tuple[Optional[int], list[str]]:
+    """単一標準担当者 pool から assignee を選ぶ。"""
+    primary = assignment_pool.get("primary_agent") if isinstance(assignment_pool, dict) else None
+    primary_id = primary.get("id") if isinstance(primary, dict) else None
+    errors: list[str] = []
+    if primary_id is None:
+        errors.append(f"{label} 標準担当者が一意に同期されていません")
+    return primary_id, errors
+
+
 def validate(record: dict) -> None:
     """投稿前検証。LLM 出力を無検証でシステムに流さない。"""
     if not isinstance(record.get("ticket_id"), int):
@@ -145,12 +180,42 @@ def process_one(path, *, dry_run: bool, verbose: bool = False) -> bool:
 
     # --- 担当者の決定論的決定---
     cfg = common.load_agents_config()
-    cursor = common.read_roundrobin()
-    agent_id, new_cursor, via = resolve_assignee(
-        record["difficulty"], record["category"], cursor=cursor,
-        light_agents=cfg.get("light_agents", []), escalation_map=cfg.get("escalation_map", {}),
-        seed=int(ticket_id),
-    )
+    support_area = str(record.get("support_area") or "").strip().lower()
+    is_special = support_area == common.SPECIAL_SUPPORT_AREA
+    is_passkey = support_area == common.PASSKEY_SUPPORT_AREA
+    standard_assignee_id = None
+    standard_group_id = None
+    standard_assignee_name = None
+    assignment_errors: list[str] = []
+    rr_pool = "default"
+    if is_special:
+        rr_pool = common.SPECIAL_SUPPORT_AREA
+        cursor = common.read_roundrobin(pool=rr_pool)
+        pool = (cfg.get("assignment_pools") or {}).get(common.SPECIAL_SUPPORT_AREA) or {}
+        standard_assignee_id, standard_group_id, agent_id, new_cursor, assignment_errors = resolve_special_assignment(
+            cursor=cursor,
+            assignment_pool=pool,
+        )
+        via = "special-roundrobin"
+        if standard_assignee_id is not None:
+            standard_assignee_name = common.agent_name(standard_assignee_id)
+    elif is_passkey:
+        cursor = common.read_roundrobin()
+        pool = (cfg.get("assignment_pools") or {}).get(common.PASSKEY_SUPPORT_AREA) or {}
+        standard_assignee_id, assignment_errors = resolve_single_agent_assignment(
+            assignment_pool=pool,
+            label="passkey",
+        )
+        agent_id, new_cursor, via = None, cursor, "passkey-fixed"
+        if standard_assignee_id is not None:
+            standard_assignee_name = common.agent_name(standard_assignee_id)
+    else:
+        cursor = common.read_roundrobin()
+        agent_id, new_cursor, via = resolve_assignee(
+            record["difficulty"], record["category"], cursor=cursor,
+            light_agents=cfg.get("light_agents", []), escalation_map=cfg.get("escalation_map", {}),
+            seed=int(ticket_id),
+        )
     # allowlist 検証: 選ばれた ID が LIGHT_AGENTS に無ければ書き込まない
     allow = common.light_agent_ids()
     if agent_id is not None and agent_id not in allow:
@@ -165,27 +230,45 @@ def process_one(path, *, dry_run: bool, verbose: bool = False) -> bool:
         if verbose:
             who = f"{assignee_name} via {via}" if agent_id is not None else "(担当者なし: 名簿未設定)"
             note = "" if can_assign else " [フィールド書込はスキップ: assignee_field_id 未設定 or 担当者なし]"
+            if is_special:
+                who = f"SPECIAL standard={standard_assignee_name or '(未設定)'}, light={who}"
+                if assignment_errors:
+                    note += f" [SPECIAL割当警告: {'; '.join(assignment_errors)}]"
+            elif is_passkey:
+                who = f"passkey standard={standard_assignee_name or '(未設定)'}"
+                if assignment_errors:
+                    note += f" [passkey割当警告: {'; '.join(assignment_errors)}]"
             common.log(f"[dry-run] would post note to ticket_{ticket_id} "
                        f"(urgency:not_assessed/{record['category']}/{record['difficulty']}); "
                        f"would assign {who}{note}; cursor は進めない")
         return True
 
     # 本番(順序重要 — assignment behavior)
-    # 実際にフィールドへ書ける場合のみメモに割り当て結果を明記(書けないのに割当済みと誤認させない)
-    if can_assign:
-        final_body = final_body.rstrip() + f"\n\n■ システム割り当て: {assignee_name}({via})"
+    if assignment_errors:
+        final_body = final_body.rstrip() + "\n割当警告: " + "; ".join(assignment_errors)
     # a,b: 内部メモ + タグ
     common.post_internal_note(int(ticket_id), final_body, tags=[SUPPORT_AI_TRIAGE_TAG])
-    # c: カスタムフィールド「担当者」セット(可能な場合のみ)
+    # c: SPECIAL/passkey チケットでは標準担当者も設定する(タグ同期で一意に決まる場合のみ)
+    if (is_special or is_passkey) and standard_assignee_id is not None:
+        common.set_ticket_assignee(
+            int(ticket_id),
+            int(standard_assignee_id),
+            group_id=int(standard_group_id) if is_special and standard_group_id is not None else None,
+        )
+    # d: カスタムフィールド「担当者」セット(可能な場合のみ)
     if can_assign:
         common.set_assignee_field(int(ticket_id), agent_id)
-        # d: 書込成功後に輪番カウンタを前進(low/normal で消費した場合のみ進む)
+        # e: 書込成功後に輪番カウンタを前進(輪番を消費した場合のみ進む)
         if new_cursor != cursor:
-            common.write_roundrobin(new_cursor)
-    # e: done へ
+            common.write_roundrobin(new_cursor, pool=rr_pool)
+    # f: done へ
     common.move_to(path, "done")
     if verbose:
         a = f", assigned {assignee_name} via {via}" if can_assign else " (担当未設定)"
+        if is_special and standard_assignee_name:
+            a += f", standard assignee {standard_assignee_name}"
+        if is_passkey and standard_assignee_name:
+            a += f", passkey standard assignee {standard_assignee_name}"
         common.log(f"posted note + tag '{SUPPORT_AI_TRIAGE_TAG}' to ticket_{ticket_id}{a} -> done/")
     return True
 
@@ -198,6 +281,8 @@ def run_once(*, dry_run: bool, verbose: bool = False) -> int:
             cfg = common.sync_agents_config()
             if verbose:
                 common.log(f"agents synced: {len(cfg.get('light_agents', []))} light agents")
+                for err in cfg.get("assignment_pool_errors", []):
+                    common.log(f"agents sync warning: {err}")
                 for err in cfg.get("escalation_errors", []):
                     common.log(f"agents sync warning: {err}")
         except Exception as e:  # noqa: BLE001

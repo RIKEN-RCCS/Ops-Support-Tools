@@ -1,5 +1,5 @@
 {
-  "_note": "Copy this to agents.json. light_agents is managed by sync_agents.py / poster.py. Keep agents.json out of git.",
+  "_note": "Copy this to agents.json. light_agents and assignment_pools are managed by sync_agents.py / poster.py. Keep agents.json out of git.",
   "assignee_field_id": null,
   "escalation_map": {
     "scheduler": null,
@@ -13,11 +13,25 @@
   "light_agents": [
     {
       "id": 1001,
-      "name": "Example Agent A"
+      "name": "Example Agent A",
+      "tags": []
     },
     {
       "id": 1002,
-      "name": "Example Agent B"
+      "name": "Example Agent B",
+      "tags": []
     }
-  ]
+  ],
+  "assignment_pools": {
+    "special": {
+      "tag": "special_support",
+      "group": null,
+      "primary_agent": null,
+      "light_agents": []
+    },
+    "passkey": {
+      "tag": "authentication_support",
+      "primary_agent": null
+    }
+  }
 }

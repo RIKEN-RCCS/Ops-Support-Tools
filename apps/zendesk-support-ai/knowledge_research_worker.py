@@ -14,6 +14,7 @@ import json
 import os
 import re
 import time
+import uuid
 from typing import Any
 
 import requests
@@ -31,9 +32,12 @@ PRESEARCH_SCHEMA_VERSION = "investigation-knowledge-presearch-v1"
 MAX_QUERIES = int(os.environ.get("SUPPORT_AI_KNOWLEDGE_RESEARCH_MAX_QUERIES", "8"))
 MAX_DOCUMENTS = int(os.environ.get("SUPPORT_AI_KNOWLEDGE_RESEARCH_MAX_DOCUMENTS", "10"))
 RAG_SEARCH_URL = os.environ.get("SUPPORT_AI_RAG_SEARCH_URL", "").strip()
+ASKDONA_MCP_URL = os.environ.get("SUPPORT_AI_ASKDONA_MCP_URL", "").strip()
 WEB_SEARCH_URL = os.environ.get("SUPPORT_AI_WEB_SEARCH_URL", "").strip()
 RAG_API_KEY = env_secret("SUPPORT_AI_RAG_API_KEY")
+ASKDONA_MCP_TOKEN = env_secret("SUPPORT_AI_ASKDONA_MCP_TOKEN")
 WEB_SEARCH_API_KEY = env_secret("SUPPORT_AI_WEB_SEARCH_API_KEY")
+ASKDONA_MCP_TOOL = os.environ.get("SUPPORT_AI_ASKDONA_MCP_TOOL", "").strip()
 
 TASK_DONE_STATUSES = {"task_done", "closed", "done"}
 
@@ -177,6 +181,195 @@ def _optional_search(name: str, url: str, api_key: str, query: str) -> dict[str,
         return {"source": name, "status": "error", "results": [], "error": str(exc)[:300]}
 
 
+def _mcp_headers(token: str, session_id: str = "") -> dict[str, str]:
+    headers = {
+        "Accept": "application/json, text/event-stream",
+        "Content-Type": "application/json",
+    }
+    if token:
+        headers["Authorization"] = "Bearer " + token
+    if session_id:
+        headers["Mcp-Session-Id"] = session_id
+    return headers
+
+
+def _mcp_payload(method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "jsonrpc": "2.0",
+        "id": str(uuid.uuid4()),
+        "method": method,
+    }
+    if params is not None:
+        payload["params"] = params
+    return payload
+
+
+def _mcp_notification(method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+    payload: dict[str, Any] = {"jsonrpc": "2.0", "method": method}
+    if params is not None:
+        payload["params"] = params
+    return payload
+
+
+def _decode_mcp_response(resp: requests.Response) -> dict[str, Any]:
+    text = resp.content.decode("utf-8", errors="replace")
+    content_type = resp.headers.get("content-type", "")
+    if "text/event-stream" in content_type or text.lstrip().startswith("event:"):
+        data_lines: list[str] = []
+        for line in text.splitlines():
+            if line.startswith("data:"):
+                data_lines.append(line.split(":", 1)[1].strip())
+        text = "\n".join(data_lines).strip() or text
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        start = text.find("{")
+        end = text.rfind("}")
+        if start >= 0 and end > start:
+            try:
+                return json.loads(text[start:end + 1])
+            except json.JSONDecodeError:
+                pass
+        return {"raw": text[:2000]}
+
+
+def _mcp_post(url: str, token: str, payload: dict[str, Any], *, session_id: str = "") -> dict[str, Any]:
+    resp = requests.post(
+        url,
+        headers=_mcp_headers(token, session_id=session_id),
+        json=payload,
+        timeout=common.HTTP_TIMEOUT,
+    )
+    data = _decode_mcp_response(resp)
+    returned_session_id = resp.headers.get("Mcp-Session-Id", "")
+    if not resp.ok:
+        return {
+            "ok": False,
+            "status_code": resp.status_code,
+            "data": data,
+            "session_id": returned_session_id,
+        }
+    if isinstance(data, dict) and data.get("error"):
+        return {
+            "ok": False,
+            "status_code": resp.status_code,
+            "data": data,
+            "session_id": returned_session_id,
+        }
+    return {"ok": True, "status_code": resp.status_code, "data": data, "session_id": returned_session_id}
+
+
+def _mcp_result_content(data: dict[str, Any]) -> Any:
+    result = data.get("result") if isinstance(data, dict) else None
+    if isinstance(result, dict) and "content" in result:
+        return result.get("content")
+    return result if result is not None else data
+
+
+def _mcp_tools(data: dict[str, Any]) -> list[dict[str, Any]]:
+    result = data.get("result") if isinstance(data, dict) else None
+    tools = result.get("tools") if isinstance(result, dict) else None
+    return tools if isinstance(tools, list) else []
+
+
+def _choose_mcp_search_tool(tools: list[dict[str, Any]]) -> str:
+    if ASKDONA_MCP_TOOL:
+        return ASKDONA_MCP_TOOL
+    preferred = ("search", "query", "retrieve", "ask")
+    for tool in tools:
+        name = str(tool.get("name") or "")
+        if any(word in name.lower() for word in preferred):
+            return name
+    return str(tools[0].get("name") or "") if tools else ""
+
+
+def _mcp_arguments_for_tool(tool: dict[str, Any], query: str) -> dict[str, Any]:
+    schema = tool.get("inputSchema") if isinstance(tool, dict) else {}
+    props = schema.get("properties") if isinstance(schema, dict) else {}
+    if isinstance(props, dict):
+        for key in ("query", "q", "question", "text", "input"):
+            if key in props:
+                args: dict[str, Any] = {key: query}
+                if "limit" in props:
+                    args["limit"] = 5
+                elif "top_k" in props:
+                    args["top_k"] = 5
+                return args
+    return {"query": query, "limit": 5}
+
+
+def _askdona_mcp_search(query: str) -> dict[str, Any]:
+    if not ASKDONA_MCP_URL:
+        return {"source": "askdona_mcp", "status": "not_configured", "results": []}
+    try:
+        init = _mcp_post(
+            ASKDONA_MCP_URL,
+            ASKDONA_MCP_TOKEN,
+            _mcp_payload("initialize", {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {"name": "ops-support-tools", "version": "0"},
+            }),
+        )
+        if not init.get("ok"):
+            return {
+                "source": "askdona_mcp",
+                "status": f"error:{init.get('status_code')}",
+                "results": [],
+                "error": init.get("data"),
+            }
+        session_id = str(init.get("session_id") or "")
+        _mcp_post(
+            ASKDONA_MCP_URL,
+            ASKDONA_MCP_TOKEN,
+            _mcp_notification("notifications/initialized"),
+            session_id=session_id,
+        )
+        listed = _mcp_post(
+            ASKDONA_MCP_URL,
+            ASKDONA_MCP_TOKEN,
+            _mcp_payload("tools/list"),
+            session_id=session_id,
+        )
+        if not listed.get("ok"):
+            return {
+                "source": "askdona_mcp",
+                "status": f"error:{listed.get('status_code')}",
+                "results": [],
+                "error": listed.get("data"),
+            }
+        tools = _mcp_tools(listed.get("data") or {})
+        tool_name = _choose_mcp_search_tool(tools)
+        if not tool_name:
+            return {"source": "askdona_mcp", "status": "error:no_tools", "results": [], "tools": []}
+        tool = next((item for item in tools if item.get("name") == tool_name), {"name": tool_name})
+        called = _mcp_post(
+            ASKDONA_MCP_URL,
+            ASKDONA_MCP_TOKEN,
+            _mcp_payload("tools/call", {
+                "name": tool_name,
+                "arguments": _mcp_arguments_for_tool(tool, query),
+            }),
+            session_id=session_id,
+        )
+        if not called.get("ok"):
+            return {
+                "source": "askdona_mcp",
+                "status": f"error:{called.get('status_code')}",
+                "results": [],
+                "tool": tool_name,
+                "error": called.get("data"),
+            }
+        return {
+            "source": "askdona_mcp",
+            "status": "ok",
+            "tool": tool_name,
+            "results": _mcp_result_content(called.get("data") or {}),
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {"source": "askdona_mcp", "status": "error", "results": [], "error": str(exc)[:300]}
+
+
 def _classify_document(doc: dict[str, Any]) -> dict[str, Any]:
     body = str(doc.get("body_md") or "")
     lower = body.lower()
@@ -216,6 +409,7 @@ def _research_body(
     queries: list[str],
     knowledge_docs: list[dict[str, Any]],
     rag_result: dict[str, Any],
+    askdona_result: dict[str, Any],
     web_result: dict[str, Any],
 ) -> str:
     classified = [_classify_document(doc) for doc in knowledge_docs]
@@ -226,6 +420,8 @@ def _research_body(
         missing.append("No strong reusable Knowledge finding or documented policy was found.")
     if rag_result.get("status") == "not_configured":
         missing.append("RAG database search is not configured yet.")
+    if askdona_result.get("status") == "not_configured":
+        missing.append("AskDona MCP RAG search is not configured yet.")
     if web_result.get("status") == "not_configured":
         missing.append("Web search service is not configured yet.")
     recommendation = "use_reusable_knowledge"
@@ -263,6 +459,8 @@ def _research_body(
         f"{json.dumps(classified, ensure_ascii=False, indent=2)}\n\n"
         "## RAG Search\n"
         f"{json.dumps(rag_result, ensure_ascii=False, indent=2)[:4000]}\n\n"
+        "## AskDona MCP Search\n"
+        f"{json.dumps(askdona_result, ensure_ascii=False, indent=2)[:4000]}\n\n"
         "## Web Search\n"
         f"{json.dumps(web_result, ensure_ascii=False, indent=2)[:4000]}\n\n"
         "## Missing Evidence / Next Step\n"
@@ -436,6 +634,7 @@ def process_one(run_ref: dict[str, Any], *, verbose: bool = False) -> bool:
             knowledge_docs = _search_knowledge(queries, exclude_ids={str(request_doc.get("id") or "")})
             main_query = " ".join(queries[:4])
             rag_result = _optional_search("rag", RAG_SEARCH_URL, RAG_API_KEY, main_query)
+            askdona_result = _askdona_mcp_search(main_query)
             web_result = _optional_search("web", WEB_SEARCH_URL, WEB_SEARCH_API_KEY, main_query)
             body = _research_body(
                 run=run,
@@ -443,6 +642,7 @@ def process_one(run_ref: dict[str, Any], *, verbose: bool = False) -> bool:
                 queries=queries,
                 knowledge_docs=knowledge_docs,
                 rag_result=rag_result,
+                askdona_result=askdona_result,
                 web_result=web_result,
             )
             doc_id = _attach_result(run, request_doc, body)

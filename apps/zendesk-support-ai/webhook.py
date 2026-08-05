@@ -247,7 +247,14 @@ def _strip_send_internal_note_marker(body: str) -> tuple[bool, str]:
     return True, "\n".join(lines[1:]).strip()
 
 
-def enqueue_ticket(ticket_id: int, *, source: str = "webhook", environment: str = "", machine: str = "") -> bool:
+def enqueue_ticket(
+    ticket_id: int,
+    *,
+    source: str = "webhook",
+    environment: str = "",
+    machine: str = "",
+    support_area: str = "",
+) -> bool:
     """ticket_id を incoming/ に冪等に積む。新規作成したら True。"""
     common.ensure_spool_dirs()
     name = f"ticket_{ticket_id}.json"
@@ -260,6 +267,7 @@ def enqueue_ticket(ticket_id: int, *, source: str = "webhook", environment: str 
         "source": source,
         "environment": environment,
         "machine": machine,
+        "support_area": support_area,
     }
     common.atomic_write_json(target, event)
     return True
@@ -394,13 +402,15 @@ def zendesk_triage_webhook():
         return jsonify({"ok": False, "error": "ticket_id not found"}), 400
     environment = _find_context_value(payload, "environment")
     machine = _find_context_value(payload, "machine")
-    queued = enqueue_ticket(ticket_id, environment=environment, machine=machine)
+    support_area = _find_context_value(payload, "support_area")
+    queued = enqueue_ticket(ticket_id, environment=environment, machine=machine, support_area=support_area)
     return jsonify({
         "ok": True,
         "ticket_id": ticket_id,
         "queued": queued,
         "environment": environment,
         "machine": machine,
+        "support_area": support_area,
     })
 
 
