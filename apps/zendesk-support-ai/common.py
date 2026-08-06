@@ -886,14 +886,17 @@ def post_public_reply(
     body: str,
     tags: Optional[List[str]] = None,
     remove_tags: Optional[List[str]] = None,
+    status: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """当該チケットへ公開返信(public:true)を追記し、タグを付与する。
+    """当該チケットへ公開返信(public:true)を追記し、タグや任意のstatusを付与する。
 
     AI は介在させず、呼び出し側が渡した本文をそのまま Zendesk へ送る。
     既存タグを消さないよう、tags/remove_tags は現在のタグへ差分適用する。
     """
     comment: Dict[str, Any] = {"body": body, "public": True}
     ticket_update: Dict[str, Any] = {"comment": comment}
+    if status:
+        ticket_update["status"] = status
     if tags or remove_tags:
         current = fetch_ticket(ticket_id).get("tags") or []
         remove = {str(tag) for tag in (remove_tags or []) if tag}
