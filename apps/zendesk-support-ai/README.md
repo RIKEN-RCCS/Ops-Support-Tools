@@ -58,7 +58,7 @@ Zendesk の新規チケット一次トリアージ、追加質問への返信ド
 | `SUPPORT_AI_SEND_INTERNAL_NOTE_MARKER` | 最新社内メモを公開返信へ転送する先頭行 marker。既定 `[SEND_INTERNAL_NOTE]` |
 | `SUPPORT_AI_INTERNAL_NOTE_SENT_TAG` | 最新社内メモを公開返信へ転送したときに付ける Zendesk tag。既定 `internal_note_sent` |
 | `SUPPORT_AI_SEND_INTERNAL_NOTE_MAX_LEN` | 最新社内メモを公開返信へ転送する最大本文長。既定 `30000` |
-| `SUPPORT_AI_SEND_INTERNAL_NOTE_STATUS` | 最新社内メモを公開返信へ転送したときに設定する ticket status。既定 `pending` |
+| `SUPPORT_SEND_INTERNAL_NOTE_STATUS` | 最新社内メモを公開返信へ転送したときに設定する ticket status。既定 `pending` |
 | `SUPPORT_AI_QUEUE_KEY` / `SUPPORT_AI_QUEUE_KEY_FILE` | スプール JSON 暗号化キー。Docker では secrets/support_ai_queue_key を使う |
 | `LLM_BASE_URL` / `LLM_API_KEY` / `LLM_API_KEY_FILE` | OpenAI 互換 LLM endpoint |
 | `SUPPORT_AI_MODEL` | 使用モデル |
@@ -155,7 +155,7 @@ POST https://your-host.example.com/zendesk/webhook/followup
 POST https://your-host.example.com/zendesk/webhook/send_internal_note
 ```
 
-この endpoint は queue や LLM を通しません。Ticket Comments API で最新の `public=false` comment を取得し、先頭行の `SUPPORT_AI_SEND_INTERNAL_NOTE_MARKER`、既定では `[SEND_INTERNAL_NOTE]`、を削除した本文を Ticket Update API の `public=true` comment として投稿します。投稿後は既存タグを保持したまま `SUPPORT_AI_INTERNAL_NOTE_SENT_TAG`、既定では `internal_note_sent`、を追加し、ticket status を `SUPPORT_AI_SEND_INTERNAL_NOTE_STATUS`、既定では `pending`、にします。
+この endpoint は queue や LLM を通しません。Ticket Comments API で最新の `public=false` comment を取得し、先頭行の `SUPPORT_AI_SEND_INTERNAL_NOTE_MARKER`、既定では `[SEND_INTERNAL_NOTE]`、を削除した本文を Ticket Update API の `public=true` comment として投稿します。投稿後は既存タグを保持したまま `SUPPORT_AI_INTERNAL_NOTE_SENT_TAG`、既定では `internal_note_sent`、を追加し、ticket status を `SUPPORT_SEND_INTERNAL_NOTE_STATUS`、既定では `pending`、にします。
 
 Zendesk trigger は社内メモ本文が `[SEND_INTERNAL_NOTE]` を含む、または先頭行が `[SEND_INTERNAL_NOTE]` になる条件で発火させます。アプリ側は最新社内メモの先頭行が marker と完全一致する場合だけ送信します。marker は公開返信本文から削除されます。
 

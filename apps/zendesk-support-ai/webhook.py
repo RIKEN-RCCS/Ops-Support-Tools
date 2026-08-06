@@ -28,7 +28,7 @@ MONITOR_QUEUES = ("incoming", "incoming_followup", "pending", "pending_followup"
 SEND_INTERNAL_NOTE_MARKER = os.environ.get("SUPPORT_AI_SEND_INTERNAL_NOTE_MARKER", "[SEND_INTERNAL_NOTE]")
 INTERNAL_NOTE_SENT_TAG = os.environ.get("SUPPORT_AI_INTERNAL_NOTE_SENT_TAG", "internal_note_sent")
 MAX_PUBLIC_REPLY_LEN = int(os.environ.get("SUPPORT_AI_SEND_INTERNAL_NOTE_MAX_LEN", "30000"))
-SEND_INTERNAL_NOTE_STATUS = os.environ.get("SUPPORT_AI_SEND_INTERNAL_NOTE_STATUS", "pending").strip()
+SEND_INTERNAL_NOTE_STATUS = os.environ.get("SUPPORT_SEND_INTERNAL_NOTE_STATUS", "pending").strip()
 
 BASE_CSS = """
 body { color: #17202a; font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 0; background: #f7f8fa; }
