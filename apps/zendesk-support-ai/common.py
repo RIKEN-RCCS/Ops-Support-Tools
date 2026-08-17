@@ -251,14 +251,37 @@ def move_queue_item(item: QueueItem, queue: str) -> QueueItem:
     _init_queue_db()
     now = int(time.time())
     with _queue_conn() as conn:
-        conn.execute(
-            """
-            UPDATE queue_items
-            SET queue = ?, updated_at = ?
-            WHERE queue = ? AND name = ?
-            """,
-            (queue, now, item.queue, item.name),
-        )
+        row = conn.execute(
+            "SELECT 1 FROM queue_items WHERE queue = ? AND name = ?",
+            (item.queue, item.name),
+        ).fetchone()
+        if not row:
+            raise FileNotFoundError(f"queue item not found: {item.queue}/{item.name}")
+        try:
+            conn.execute(
+                """
+                UPDATE queue_items
+                SET queue = ?, updated_at = ?
+                WHERE queue = ? AND name = ?
+                """,
+                (queue, now, item.queue, item.name),
+            )
+        except sqlite3.IntegrityError:
+            # Queue transitions are operational bookkeeping. If an older done/failed
+            # item with the same name already exists, replace it so the source item
+            # is still consumed and workers do not retry forever.
+            conn.execute(
+                "DELETE FROM queue_items WHERE queue = ? AND name = ?",
+                (queue, item.name),
+            )
+            conn.execute(
+                """
+                UPDATE queue_items
+                SET queue = ?, updated_at = ?
+                WHERE queue = ? AND name = ?
+                """,
+                (queue, now, item.queue, item.name),
+            )
     return QueueItem(queue=queue, name=item.name)
 
 

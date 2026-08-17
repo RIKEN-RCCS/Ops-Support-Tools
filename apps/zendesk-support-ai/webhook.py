@@ -274,7 +274,14 @@ def enqueue_ticket(
     return True
 
 
-def enqueue_followup(ticket_id: int, *, comment_id: Optional[int] = None, source: str = "webhook") -> bool:
+def enqueue_followup(
+    ticket_id: int,
+    *,
+    comment_id: Optional[int] = None,
+    source: str = "webhook",
+    environment: str = "",
+    machine: str = "",
+) -> bool:
     """追加質問/追記コメント用の別キューに ticket_id を積む。"""
     common.ensure_spool_dirs()
     name = f"ticket_{ticket_id}"
@@ -289,6 +296,8 @@ def enqueue_followup(ticket_id: int, *, comment_id: Optional[int] = None, source
         "received_at": int(time.time()),
         "source": source,
         "job": "followup",
+        "environment": environment,
+        "machine": machine,
     }
     common.atomic_write_json(target, event)
     return True
@@ -424,8 +433,18 @@ def zendesk_followup_webhook():
     if ticket_id is None:
         return jsonify({"ok": False, "error": "ticket_id not found"}), 400
     comment_id = _find_comment_id(payload)
-    queued = enqueue_followup(ticket_id, comment_id=comment_id)
-    return jsonify({"ok": True, "job": "followup", "ticket_id": ticket_id, "comment_id": comment_id, "queued": queued})
+    environment = _find_context_value(payload, "environment")
+    machine = _find_context_value(payload, "machine")
+    queued = enqueue_followup(ticket_id, comment_id=comment_id, environment=environment, machine=machine)
+    return jsonify({
+        "ok": True,
+        "job": "followup",
+        "ticket_id": ticket_id,
+        "comment_id": comment_id,
+        "queued": queued,
+        "environment": environment,
+        "machine": machine,
+    })
 
 
 @app.post("/zendesk/webhook/send_internal_note")

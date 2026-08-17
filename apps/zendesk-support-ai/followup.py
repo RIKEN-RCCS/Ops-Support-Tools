@@ -82,6 +82,13 @@ def _looks_like_followup_question(body: str) -> bool:
     ))
 
 
+def _event_name(ticket_id: int, comment_id: Optional[int]) -> str:
+    name = f"ticket_{ticket_id}"
+    if comment_id is not None:
+        name += f"_comment_{comment_id}"
+    return f"{name}.json"
+
+
 def _pick_followup_comment(ticket: dict[str, Any], comments: list[dict[str, Any]], comment_id: Optional[int]) -> Optional[dict[str, Any]]:
     requester_id = ticket.get("requester_id")
     if comment_id is not None:
@@ -105,7 +112,16 @@ def _pick_followup_comment(ticket: dict[str, Any], comments: list[dict[str, Any]
     return None
 
 
+def _should_post_no_followup_note(ticket_id: int, comment_id: Optional[int]) -> bool:
+    name = _event_name(ticket_id, comment_id)
+    # A prior done/failed item means this same webhook input has already been
+    # handled. Do not create a new internal note that can retrigger Zendesk.
+    return not (common.queue_exists("done", name) or common.queue_exists("failed", name))
+
+
 def _note_no_followup(ticket_id: int, *, reason: str, comment_id: Optional[int]) -> None:
+    if not _should_post_no_followup_note(ticket_id, comment_id):
+        return
     detail = f"comment_id={comment_id}" if comment_id is not None else "comment_id=(未指定)"
     body = (
         "Followup webhook が発火しましたが、追加質問らしいエンドユーザー公開コメントを確認できませんでした。\n\n"
@@ -142,10 +158,11 @@ def process_one(path, verbose: bool = False) -> bool:
         event["comment_id"] = int(comment.get("id")) if comment.get("id") is not None else comment_id
         event["accepted_at"] = int(time.time())
         event["job"] = "followup"
-        target_name = f"ticket_{ticket_id}"
-        if event["comment_id"] is not None:
-            target_name += f"_comment_{event['comment_id']}"
-        common.atomic_write_json(common.spool_path("pending_followup") / f"{target_name}.json", event)
+        target_name = _event_name(ticket_id, event["comment_id"])
+        if common.queue_exists("pending_followup", target_name) or common.queue_exists("done", target_name):
+            common.move_to(path, "done")
+            return False
+        common.atomic_write_json(common.spool_path("pending_followup") / target_name, event)
         path.unlink()
         if verbose:
             common.log(f"followup accepted ticket_{ticket_id} -> pending_followup/")
