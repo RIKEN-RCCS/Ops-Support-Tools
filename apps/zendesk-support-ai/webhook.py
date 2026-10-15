@@ -406,6 +406,8 @@ def monitor_queue_item(queue: str, name: str):
 def zendesk_triage_webhook():
     if not _authorized():
         return jsonify({"ok": False, "error": "unauthorized"}), 401
+    if os.environ.get("SUPPORT_AI_WEBHOOK_AI_ENABLED", "1").lower() in ("0", "false", "no"):
+        return jsonify({"ok": False, "error": "AI processing temporarily unavailable"}), 503
     payload = request.get_json(silent=True) or {}
     ticket_id = _find_ticket_id(payload)
     if ticket_id is None:
@@ -428,6 +430,8 @@ def zendesk_triage_webhook():
 def zendesk_followup_webhook():
     if not _authorized():
         return jsonify({"ok": False, "error": "unauthorized"}), 401
+    if os.environ.get("SUPPORT_AI_WEBHOOK_AI_ENABLED", "1").lower() in ("0", "false", "no"):
+        return jsonify({"ok": False, "error": "AI processing temporarily unavailable"}), 503
     payload = request.get_json(silent=True) or {}
     ticket_id = _find_ticket_id(payload)
     if ticket_id is None:

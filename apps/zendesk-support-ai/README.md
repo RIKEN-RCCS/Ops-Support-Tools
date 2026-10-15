@@ -447,6 +447,20 @@ docker compose exec -T generator python eval_runbook_llm.py --relaxed-json --mod
 
 ## Monitor
 
+### Webhook availability during an LLM outage
+
+The webhook process does not call the LLM: triage/followup enqueue work, while
+`send_internal_note` sends a human-written note through the Zendesk relay.
+Compose sets `SUPPORT_AI_STARTUP_LLM_CHECKS=0` for the webhook only, so its
+startup still checks Zendesk and the queue without depending on the LLM.
+Workers keep the LLM startup check enabled by default.
+
+To serve `send_internal_note` while AI workers are stopped, set the webhook's
+`SUPPORT_AI_WEBHOOK_AI_ENABLED=0` and recreate only that service. Triage/followup
+then return HTTP 503 without enqueuing; authentication and marker validation
+remain enabled for `send_internal_note`. Restore this setting to `1` and
+recreate the webhook after the LLM and workers recover.
+
 `webhook` service also provides a small queue monitor for operators:
 
 ```text

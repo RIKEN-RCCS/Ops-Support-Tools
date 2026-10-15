@@ -49,7 +49,8 @@ def preflight() -> None:
     if isinstance(user, dict):
         common.log(f"startup zendesk user: id={user.get('id')} role={user.get('role')} role_type={user.get('role_type')}")
 
-    _retry("llm", llm_client.healthcheck, retries=retries, delay=delay)
+    if _enabled("SUPPORT_AI_STARTUP_LLM_CHECKS", "1"):
+        _retry("llm", llm_client.healthcheck, retries=retries, delay=delay)
 
     if _enabled("SUPPORT_AI_SYNC_AGENTS_ON_STARTUP", "1"):
         cfg = _retry("agents sync", common.sync_agents_config, retries=retries, delay=delay)

@@ -7,3 +7,6 @@ __pycache__/
 
 agents.json
 spool/
+secrets/
+data/
+config/

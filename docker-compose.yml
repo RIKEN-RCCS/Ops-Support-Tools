@@ -24,7 +24,11 @@ services:
     env_file:
       - path: ./apps/zendesk-support-ai/.env
         required: false
-    environment: *support-secret-env
+    environment:
+      <<: *support-secret-env
+      # Webhook queues AI work and sends human-written notes without calling LLM.
+      SUPPORT_AI_STARTUP_LLM_CHECKS: "0"
+      SUPPORT_AI_WEBHOOK_AI_ENABLED: ${SUPPORT_AI_WEBHOOK_AI_ENABLED:-1}
     secrets: *support-secrets
     ports:
       - "127.0.0.1:18080:8080"
