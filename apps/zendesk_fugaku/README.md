@@ -214,3 +214,32 @@ nginx では `/zendesk_fugaku/api/v2/` など必要最小限の path だけを�
 OAuth refresh は定期refreshと、Zendesk API 呼び出し前の期限確認でアプリ内部だけが実行します。refresh専用の外部endpointは持ちません。
 
 `/events` も運用確認用なので、外部公開する場合は連携元/運用者IPに絞ってください。
+
+## Directory synchronization APIs (2026-10-14)
+
+The relay additionally supports these explicit method/path combinations:
+
+- GET: `/api/v2/users.json`, `/api/v2/organizations.json`, `/api/v2/organization_memberships.json`, `/api/v2/groups.json`, `/api/v2/group_memberships.json`, `/api/v2/organizations/search.json`, `/api/v2/organizations/show_many.json`, `/api/v2/users/search.json`, `/api/v2/users/show_many.json`, `/api/v2/job_statuses/{id}.json`.
+- POST: `/api/v2/organizations/create_many.json`, `/api/v2/users.json`, `/api/v2/users/create_many.json`, `/api/v2/organization_memberships.json`, `/api/v2/organization_memberships/create_many.json`.
+- PUT: `/api/v2/organizations/update_many.json`, `/api/v2/users/{id}.json`, `/api/v2/users/update_many.json`, `/api/v2/users/{user_id}/identities/{identity_id}.json`.
+- DELETE: `/api/v2/organizations/destroy_many.json`, `/api/v2/users/destroy_many.json`.
+
+All require the relay Bearer token and the nginx source IP allowlist. Query
+parameters, including repeated `role[]`, cursor parameters, and update request
+bodies are forwarded. Status codes and response bodies are returned unchanged.
+Unsupported paths and methods are not forwarded. OAuth scopes and Zendesk role
+permissions still determine whether the upstream operation is allowed.
+
+Integration base URL: `https://support.example.com/zendesk_fugaku`.
+For list scripts ending their base URL in `/api/v2/`, use
+`https://support.example.com/zendesk_fugaku/api/v2/`.
+Pagination links and asynchronous job URLs in responses retain their original
+Zendesk URL; replace only the expected `https://your-subdomain.zendesk.com` origin with
+the integration base URL before following them through the relay.
+
+Offline forwarding/authentication tests: `python test_directory_api.py`.
+
+The standalone [all-API test](tools/README.md) checks the requested read/write
+operations using uniquely marked test users/organizations, then deletes them.
+It reads the relay token from a file and requires no Python packages beyond
+the standard library. See that guide for execution, results, and cleanup-only retry.

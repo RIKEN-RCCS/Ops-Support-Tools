@@ -13,6 +13,7 @@ import fcntl
 import hmac
 import json
 import os
+import re
 import sqlite3
 import tempfile
 import threading
@@ -395,7 +396,7 @@ class ZendeskClient:
         method: str,
         path: str,
         *,
-        params: dict[str, str] | None = None,
+        params: dict[str, str] | list[tuple[str, str]] | None = None,
         body: bytes | None = None,
         content_type: str = "",
     ) -> requests.Response:
@@ -530,7 +531,7 @@ def build_app(config: Config) -> Flask:
         path: str,
         *,
         event_prefix: str,
-        params: dict[str, str] | None = None,
+        params: dict[str, str] | list[tuple[str, str]] | None = None,
         body: bytes | None = None,
         content_type: str = "",
         ticket_id: int | None = None,
@@ -572,22 +573,20 @@ def build_app(config: Config) -> Flask:
 
     @app.get("/api/v2/search.json")
     def proxy_search():
-        query = request.args.get("query", "")
         return proxy_zendesk(
             "GET",
             "/api/v2/search.json",
             event_prefix="search",
-            params={"query": query},
+            params=list(request.args.items(multi=True)),
         )
 
     @app.get("/api/v2/organizations/search.json")
     def proxy_organization_search():
-        name = request.args.get("name", "")
         return proxy_zendesk(
             "GET",
             "/api/v2/organizations/search.json",
             event_prefix="organization_search",
-            params={"name": name},
+            params=list(request.args.items(multi=True)),
         )
 
     @app.post("/api/v2/tickets.json")
@@ -623,6 +622,47 @@ def build_app(config: Config) -> Flask:
             params=params,
             body=request.get_data(),
             content_type=request.headers.get("Content-Type", "application/binary"),
+        )
+
+    @app.route("/api/v2/<path:subpath>", methods=["GET", "POST", "PUT", "DELETE"])
+    def proxy_directory_api(subpath: str):
+        allowed = {
+            "users.json": {"GET", "POST"},
+            "organizations.json": {"GET"},
+            "organization_memberships.json": {"GET", "POST"},
+            "groups.json": {"GET"},
+            "group_memberships.json": {"GET"},
+            "organizations/search.json": {"GET"},
+            "organizations/show_many.json": {"GET"},
+            "users/search.json": {"GET"},
+            "users/show_many.json": {"GET"},
+            "organizations/create_many.json": {"POST"},
+            "users/create_many.json": {"POST"},
+            "organization_memberships/create_many.json": {"POST"},
+            "organizations/update_many.json": {"PUT"},
+            "users/update_many.json": {"PUT"},
+            "organizations/destroy_many.json": {"DELETE"},
+            "users/destroy_many.json": {"DELETE"},
+        }
+        methods = allowed.get(subpath)
+        if re.fullmatch(r"job_statuses/[A-Za-z0-9_-]+\.json", subpath):
+            methods = {"GET"}
+        elif re.fullmatch(r"users/[0-9]+(?:/identities/[0-9]+)?\.json", subpath):
+            methods = {"PUT"}
+        guard = require_ready_and_authorized()
+        if guard is not None:
+            return guard
+        if methods is None:
+            return jsonify({"ok": False, "error": "unsupported API endpoint"}), 404
+        if request.method not in methods:
+            return jsonify({"ok": False, "error": "unsupported API method"}), 405
+        return proxy_zendesk(
+            request.method,
+            "/api/v2/" + subpath,
+            event_prefix="directory_api",
+            params=list(request.args.items(multi=True)),
+            body=request.get_data() if request.method != "GET" else None,
+            content_type=request.headers.get("Content-Type", "application/json"),
         )
 
     @app.get("/events")
