@@ -3,7 +3,7 @@ set -eu
 
 SIF_PATH="${RUNBOOK_GATEWAY_SIF:-/opt/support-ai/runbook-gateway.sif}"
 TOKEN_PATH="${RUNBOOK_GATEWAY_TOKEN_PATH:-/etc/support-ai/knowledge_write_token}"
-API_URL="${RUNBOOK_GATEWAY_KNOWLEDGE_API_URL:-https://support.example.com}"
+API_URL="${RUNBOOK_GATEWAY_KNOWLEDGE_API_URL:?Set the Knowledge API base URL in private configuration}"
 MACHINE="${RUNBOOK_GATEWAY_MACHINE:-}"
 ENVIRONMENT="${RUNBOOK_GATEWAY_ENVIRONMENT:-}"
 

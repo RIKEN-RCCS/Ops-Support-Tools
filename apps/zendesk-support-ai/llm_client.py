@@ -22,6 +22,7 @@ import requests
 
 from secret_config import env_secret
 import target_normalizer
+import site_policy
 
 LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "https://api.example.com/v1").rstrip("/")
 DEFAULT_MODEL = os.environ.get("SUPPORT_AI_MODEL", "")
@@ -67,7 +68,7 @@ MACHINE_CANDIDATES = target_normalizer.machine_candidates()
 MACHINE_ALIAS_GUIDE = target_normalizer.machine_alias_guide()
 TARGET_CONFIDENCES = ["none", "low", "medium", "high"]
 TARGET_RESOLUTIONS = ["identified_from_text", "ask_user", "operator_select", "runbook_identify", "unknown_stop"]
-SUPPORT_AREAS = ["general", "special", "passkey"]
+SUPPORT_AREAS = ["general", site_policy.SPECIAL_SUPPORT_AREA, site_policy.PASSKEY_SUPPORT_AREA]
 
 # トリアージ出力スキーマ。業務上の優先度はAI判断から外すため severity は出させない。
 SUPPORT_AI_TRIAGE_SCHEMA: Dict[str, Any] = {
@@ -79,7 +80,7 @@ SUPPORT_AI_TRIAGE_SCHEMA: Dict[str, Any] = {
         "support_area": {
             "type": "string",
             "enum": SUPPORT_AREAS,
-            "description": "SPECIAL関連なら special、パスキー関連なら passkey、それ以外は general。担当者割当に使うため不確かな場合は general",
+            "description": site_policy.SUPPORT_AREA_DESCRIPTION,
         },
         "support_area_confidence": {
             "type": "string",
@@ -88,7 +89,7 @@ SUPPORT_AI_TRIAGE_SCHEMA: Dict[str, Any] = {
         },
         "support_area_reason": {
             "type": "string",
-            "description": "support_area 判定の根拠。special/passkey と判断した語句・文脈、またはgeneralに倒した理由",
+            "description": site_policy.SUPPORT_AREA_REASON_DESCRIPTION,
         },
         "difficulty": {
             "type": "string", "enum": DIFFICULTIES,
@@ -798,8 +799,8 @@ def triage(masked_subject: str, masked_body: str, *, model: Optional[str] = None
         "個人情報は [EMAIL_1] のようなプレースホルダで伏せられています。"
         "プレースホルダはそのまま保持し、新しいプレースホルダを創作しないでください。"
         "category と difficulty は必ず指定された enum から選んでください。"
-        "担当分類は非公開の設置先設定で指定します。"
-        f"category の判断基準: {CATEGORY_GUIDE}。"
+        + site_policy.SUPPORT_AREA_INSTRUCTIONS
+        + f"category の判断基準: {CATEGORY_GUIDE}。"
         "difficulty は、専門外のスタッフが AI 補助で一次対応できそうなら low/normal、"
         "専門知識や深い調査が要りそうなら high と判断してください。"
         "環境固有のソフトウェアスタック、module、コンパイラ、MPI、CUDA、ストレージ、"

@@ -206,7 +206,7 @@ def _resolved_support_area(event: dict, triage: dict) -> tuple[str, str, str]:
         return explicit, "identified_from_webhook", "Zendesk webhook payload に support_area が含まれていたため。"
     area = str(triage.get("support_area") or "general").strip().lower()
     confidence = str(triage.get("support_area_confidence") or "none").strip().lower()
-    if area in {"special", "passkey"} and confidence == "high":
+    if area in {common.SPECIAL_SUPPORT_AREA, common.PASSKEY_SUPPORT_AREA} and confidence == "high":
         return area, "identified_from_text", str(triage.get("support_area_reason") or "")
     return "general", "default_general", str(triage.get("support_area_reason") or "")
 
@@ -341,7 +341,7 @@ def _build_short_note_body(triage: dict, model: str, *, knowledge_run_id: str | 
     area = triage.get("support_area", "general")
     category = triage.get("category", "other")
     confidence = triage.get("answer_confidence", "low")
-    if area in {"special", "passkey"}:
+    if area in {common.SPECIAL_SUPPORT_AREA, common.PASSKEY_SUPPORT_AREA}:
         header = f"🤖 AI一次トリアージ: {area} / confidence={confidence}"
     else:
         header = f"🤖 AI一次トリアージ: {area} / {category} / confidence={confidence}"

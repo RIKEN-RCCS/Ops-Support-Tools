@@ -1,4 +1,4 @@
-# 富岳中継APIの一括テスト
+# Zendesk中継APIの一括テスト
 
 `test_all_apis.py`は送信元IPが許可済みの連携ホストで実行する
 Python 3.8以上・追加パッケージ不要のテストスクリプトです。
@@ -11,8 +11,12 @@ Bearerトークンは指定ファイルから読み、コマンド引数や出�
 ```bash
 chmod 600 /path/to/zendesk_fugaku_relay_token
 python3 test_all_apis.py \
-  --token-file /path/to/zendesk_fugaku_relay_token
+  --token-file /path/to/zendesk_fugaku_relay_token \
+  --base-url https://relay.example.com/zendesk_fugaku \
+  --upstream-url https://your-subdomain.zendesk.com
 ```
+
+接続先は必須です。`ZENDESK_RELAY_TEST_BASE_URL`と`ZENDESK_RELAY_TEST_UPSTREAM_URL`を非公開の環境設定から指定することもできます。後者はページネーション元の許可originです。cleanup-onlyは保存済み接続先を使い、異なるoriginを自動追跡しません。
 
 全APIを使うため、実行するとZendeskに専用のend-user 2件・組織2件を作成し、
 それらに組織所属を設定、notes・identityを更新して、最後に削除します。

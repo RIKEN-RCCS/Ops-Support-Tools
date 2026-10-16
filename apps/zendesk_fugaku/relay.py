@@ -159,7 +159,7 @@ class Config:
         scopes = [item.strip() for item in scopes_raw.replace(",", " ").split() if item.strip()]
         data_dir = Path(os.environ.get("ZENDESK_FUGAKU_DATA_DIR", "/data"))
         return cls(
-            zendesk_url=os.environ.get("ZENDESK_FUGAKU_URL", "https://your-subdomain.zendesk.com").rstrip("/"),
+            zendesk_url=os.environ.get("ZENDESK_FUGAKU_URL", "").rstrip("/"),
             client_identifier=os.environ.get("ZENDESK_FUGAKU_OAUTH_CLIENT_IDENTIFIER", "").strip(),
             client_secret=read_secret("ZENDESK_FUGAKU_OAUTH_CLIENT_SECRET"),
             token_bundle_file=Path(os.environ.get(
@@ -172,8 +172,8 @@ class Config:
             refresh_margin_seconds=int(os.environ.get("ZENDESK_FUGAKU_REFRESH_MARGIN_SECONDS", "600")),
             periodic_refresh_seconds=int(os.environ.get("ZENDESK_FUGAKU_PERIODIC_REFRESH_SECONDS", "1200")),
             default_public_comment=env_bool("ZENDESK_FUGAKU_DEFAULT_PUBLIC_COMMENT", True),
-            default_tags=env_list("ZENDESK_FUGAKU_DEFAULT_TAGS", ["external_relay", "integration_event"]),
-            ticket_subject_prefix=os.environ.get("ZENDESK_FUGAKU_TICKET_SUBJECT_PREFIX", "[Integration]"),
+            default_tags=env_list("ZENDESK_FUGAKU_DEFAULT_TAGS", []),
+            ticket_subject_prefix=os.environ.get("ZENDESK_FUGAKU_TICKET_SUBJECT_PREFIX", ""),
             timeout=float(os.environ.get("ZENDESK_FUGAKU_HTTP_TIMEOUT", "30")),
         )
 

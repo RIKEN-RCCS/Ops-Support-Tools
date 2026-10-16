@@ -243,7 +243,7 @@ def process_one(path, *, dry_run: bool, verbose: bool = False) -> bool:
                        f"would assign {who}{note}; cursor は進めない")
         return True
 
-    # 本番(順序重要 — assignment behavior)
+    # 本番(順序重要)
     if assignment_errors:
         final_body = final_body.rstrip() + "\n割当警告: " + "; ".join(assignment_errors)
     # a,b: 内部メモ + タグ
@@ -295,7 +295,7 @@ def run_once(*, dry_run: bool, verbose: bool = False) -> int:
                 n += 1
         except Exception as e:
             common.log(f"post error ticket (item {f.name}): {e}")
-            # 投稿失敗はファイルを pending に残す(リトライ容易性 — documented behavior)
+            # 投稿失敗はファイルを pending に残す(リトライ容易性)
     if verbose:
         common.log(f"poster done: {len(files)} pending, {n} {'validated' if dry_run else 'posted'}")
     return n

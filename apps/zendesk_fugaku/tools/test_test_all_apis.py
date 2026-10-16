@@ -95,11 +95,18 @@ class FakeAPI:
 
 
 class SuiteTests(unittest.TestCase):
+    def test_missing_endpoint_stops_before_reading_token_or_network(self):
+        with patch.object(live.API, 'request') as request, patch.dict(live.os.environ, {}, clear=True):
+            with self.assertRaises(SystemExit) as error:
+                live.main(['--token-file', '/not-used'])
+            self.assertEqual(error.exception.code, 2)
+            request.assert_not_called()
+
     def setUp(self):
         self.tmp=tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.api=FakeAPI()
-        self.state={'run_id':'zrelaytest-20261015-abcdef012345','base_url':live.DEFAULT_BASE,
+        self.state={'run_id':'zrelaytest-20261015-abcdef012345','base_url':'https://relay.example.com','upstream_url':'https://your-subdomain.zendesk.com',
             'users':[],'organizations':[],'pending_jobs':[],'unresolved_creates':{},
             'creation_attempted':False,'cleanup_complete':False}
         self.suite=live.Suite(self.api,self.state,Path(self.tmp.name)/'state.json',0.01,0.001)
@@ -199,7 +206,7 @@ class SuiteTests(unittest.TestCase):
 
     def test_cli_has_no_network_when_token_file_is_invalid(self):
         with patch.object(live.API,'request',side_effect=AssertionError('network')):
-            with self.assertRaises(SystemExit):live.main(['--token-file',str(Path(self.tmp.name)/'absent')])
+            with self.assertRaises(SystemExit):live.main(['--token-file',str(Path(self.tmp.name)/'absent'),'--base-url','https://relay.example.com','--upstream-url','https://your-subdomain.zendesk.com'])
 
     def test_api_rejects_plaintext_and_redirect(self):
         with self.assertRaises(ValueError):live.API('http://example.invalid','secret')
@@ -210,7 +217,7 @@ class SuiteTests(unittest.TestCase):
         token.write_text('offline-test-secret\n')
         output=Path(self.tmp.name)/'run'
         with patch.object(live,'API',return_value=self.api), patch.object(live.signal,'signal'):
-            code=live.main(['--token-file',str(token),'--output-dir',str(output)])
+            code=live.main(['--token-file',str(token),'--output-dir',str(output),'--base-url','https://relay.example.com','--upstream-url','https://your-subdomain.zendesk.com'])
         self.assertEqual(code,0)
         report=json.loads((output/'report.json').read_text())
         self.assertTrue(report['cleanup_complete'])
@@ -229,7 +236,7 @@ class SuiteTests(unittest.TestCase):
             raise KeyboardInterrupt()
         with patch.object(live,'API',return_value=self.api), patch.object(live.signal,'signal'), \
                 patch.object(live.Suite,'run',interrupted):
-            code=live.main(['--token-file',str(token),'--output-dir',str(output)])
+            code=live.main(['--token-file',str(token),'--output-dir',str(output),'--base-url','https://relay.example.com','--upstream-url','https://your-subdomain.zendesk.com'])
         self.assertEqual(code,1)
         self.assertEqual(list(self.api.users),[1])
         report=json.loads((output/'report.json').read_text())

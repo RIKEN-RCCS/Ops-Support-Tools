@@ -30,7 +30,7 @@ Zendesk の新規チケット一次トリアージ、追加質問への返信ド
 - 例外として、`/zendesk/webhook/send_internal_note` は人間が作った最新社内メモを AI なしで公開返信へ転送します。
 - AI は担当者 ID を出しません。担当者は `agents.json` と決定論的ロジックで選びます。
 - ラウンドロビン対象の `light_agents` は Zendesk から同期します。
-- triage AI はチケット本文から SPECIAL / passkey 関連かどうかも判定します。SPECIAL チケットだけは例外として、Zendesk group `SPECIAL` と user tag `special_support` から同期した標準担当者へ ticket group/assignee を設定し、SPECIAL 用 light agent pool から「対応担当」をラウンドロビンします。passkey チケットは user tag `authentication_support` から同期した単一担当者へ ticket assignee を設定します。
+- 担当領域の分類基準と担当タグ・グループ名は非公開のsite policyへ設定します。専用プールと単一担当者プールを利用でき、設定不備では自動割当を保留します。
 - `config/agents.json`、`.env`、`secrets/`、`spool/` は Git に入れない前提です。
 - 本番 Docker では秘密値を `.env` / `env_file` で渡さず、Docker secrets ファイルとして渡します。
 
@@ -40,6 +40,7 @@ Zendesk の新規チケット一次トリアージ、追加質問への返信ド
 
 | Variable | Purpose |
 |---|---|
+| `SUPPORT_AI_SITE_POLICY_FILE` | 非公開の担当分類・割当設定JSON。指定ファイルが読めない場合は起動を中止 |
 | `SUPPORT_AI_QUEUE_DIR` | SQLite queue とレガシースプールディレクトリの保存先 |
 | `SUPPORT_AI_QUEUE_DB` | support AI worker のSQLite queue DB。既定は `$SUPPORT_AI_QUEUE_DIR/queue.sqlite` |
 | `SUPPORT_AI_TRIAGE_TAG` | 投稿済み判定に使う Zendesk tag |
@@ -82,25 +83,38 @@ Zendesk の新規チケット一次トリアージ、追加質問への返信ド
 | `SUPPORT_AI_SYNC_AGENTS_ON_POST` | `poster.py` 実行時に Zendesk から `light_agents` を同期する |
 | `SUPPORT_AI_LIGHT_AGENT_ROLE_TYPE` | light agent 判定に使う Zendesk `role_type`。既定 `1` |
 | `SUPPORT_AI_ASSIGNEE_FIELD_ID` | Zendesk の「対応担当」ticket custom field id。未設定だと担当者フィールドを書き込まない |
-| `SUPPORT_AI_SPECIAL_SUPPORT_AREA` | SPECIAL 用 support area 値。既定 `special` |
-| `SUPPORT_AI_SPECIAL_AGENT_TAG` | SPECIAL チーム判定に使う Zendesk user tag。既定 `special_support` |
-| `SUPPORT_AI_SPECIAL_GROUP_NAME` | SPECIAL チケットへ設定する Zendesk group 名。既定 `SPECIAL` |
-| `SUPPORT_AI_SPECIAL_GROUP_ID` | SPECIAL group id を明示する場合に設定。未設定なら `SUPPORT_AI_SPECIAL_GROUP_NAME` で同期時に解決 |
+| `SUPPORT_AI_SPECIAL_SUPPORT_AREA` | 専用プールの担当領域。site policyまたは環境変数で指定 |
+| `SUPPORT_AI_SPECIAL_AGENT_TAG` | 専用プールの担当者タグ。site policyで指定 |
+| `SUPPORT_AI_SPECIAL_GROUP_NAME` | 専用プールのグループ名。site policyで指定 |
+| `SUPPORT_AI_SPECIAL_GROUP_ID` | 専用グループID を明示する場合に設定。未設定なら `SUPPORT_AI_SPECIAL_GROUP_NAME` で同期時に解決 |
 | `SUPPORT_AI_PASSKEY_SUPPORT_AREA` | passkey 用 support area 値。既定 `passkey` |
-| `SUPPORT_AI_PASSKEY_AGENT_TAG` | passkey 担当者判定に使う Zendesk user tag。既定 `authentication_support` |
+| `SUPPORT_AI_PASSKEY_AGENT_TAG` | passkey 担当者判定に使う Zendesk user tag。site policyで指定 |
 | `SUPPORT_AI_LLM_HEALTHCHECK_PATH` | LLM 疎通確認 endpoint。既定 `/models` |
 
 `SUPPORT_AI_ASSIGNEE_FIELD_ID` は担当者自動設定に必須です。Zendesk の管理画面で対象の ticket custom field id を確認し、環境ごとの `.env` に設定してください。
 
 担当者フィールドを使う場合は `agents.example.json` を `agents.json` にコピーし、Zendesk の ticket custom field id を `assignee_field_id` に設定します。`light_agents` と `assignment_pools` は `sync_agents.py` または `poster.py` が Zendesk から更新します。
 
-SPECIAL チームは Zendesk group と user tag で管理します。既定では Zendesk group 名 `SPECIAL` を ticket group、`special_support` が付いた非 light agent 1 名を ticket の標準担当者、同じ tag が付いた light agent を SPECIAL 用「対応担当」ラウンドロビン対象にします。SPECIAL 用 pool が不完全な場合、通常 light agent pool へはフォールバックせず、割当警告を社内メモへ残します。group 名で一意に解決できない環境では `SUPPORT_AI_SPECIAL_GROUP_ID` を設定します。
+担当領域・分類基準・Zendesk担当タグ・グループ名は、設置先ごとの非公開設定です。`config/site-policy.json`を作成し、`.env`の`SUPPORT_AI_SITE_POLICY_FILE=/config/site-policy.json`で指定します。既存の`/config` volumeを使うため追加の公開マウント設定は不要です。ファイルはGitとDocker build contextから除外します。
 
-SPECIAL チケットかどうかは、Zendesk から送られた ticket id を元に取得した件名・本文を triage AI が読み、`support_area=special` かつ高確信の場合だけ採用します。単に AI、GPU、CUDA、MPI、スパコン等の一般的な問い合わせであるだけでは SPECIAL 扱いにしません。
+設定例（実値は公開ファイルへ書かない）:
 
-Deployment-specific routing rules belong in private configuration.
+```json
+{
+  "special_support_area": "special",
+  "special_agent_tag": "special_support",
+  "special_group_name": "Specialist",
+  "special_group_id": "",
+  "passkey_support_area": "passkey",
+  "passkey_agent_tag": "authentication_support",
+  "support_area_description": "Use configured areas; choose general when uncertain",
+  "support_area_instructions": "担当領域を確実に判断できる場合のみ設定済み領域を選び、不明ならgeneralにする。"
+}
+```
 
-Zendesk に投稿するAI社内メモは、サポート担当者の作業画面を邪魔しないよう最小限にします。詳細な triage 内容、回答ゲート、runbook/Knowledge 情報は pending payload と Knowledge 側に残します。Knowledge の run view が運用上十分に見やすくなるまでは、社内メモには Knowledge リンクを載せません。
+専用プールはグループ・標準担当者・light agentを別々に解決します。プール不備で通常プールへフォールバックしません。単一担当者プールではタグが一致する担当者が1名の場合だけ設定します。担当領域の変更時は保存済みqueue・名簿との互換性を確認し、既存運用では値を引き継いでください。旧組織名を含む設定項目は`SUPPORT_AI_SPECIAL_*`またはsite policyへ移行してください。
+
+社内メモは概要を示し、詳細な判定・回答ゲート・調査情報はqueue payloadとKnowledgeで確認します。
 
 `escalation_map` は user id ではなく人名または email で書けます。値は単一値またはリストにできます。
 

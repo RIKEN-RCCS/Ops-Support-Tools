@@ -144,7 +144,7 @@ class Config:
         scopes = [item.strip() for item in scopes_raw.replace(",", " ").split() if item.strip()]
         return cls(
             zendesk_url=os.environ.get("ZENDESK_URL", "").rstrip("/"),
-            client_identifier=os.environ.get("ZENDESK_OAUTH_CLIENT_IDENTIFIER", "replace-with-client-identifier"),
+            client_identifier=os.environ.get("ZENDESK_OAUTH_CLIENT_IDENTIFIER", ""),
             client_secret=read_secret("ZENDESK_OAUTH_CLIENT_SECRET"),
             redirect_uri=os.environ.get("ZENDESK_OAUTH_REDIRECT_URI", "http://localhost"),
             token_bundle_file=Path(os.environ.get(

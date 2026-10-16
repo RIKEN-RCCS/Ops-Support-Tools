@@ -158,7 +158,7 @@ class Config:
         scopes = [item.strip() for item in scopes_raw.replace(",", " ").split() if item.strip()]
         data_dir = Path(os.environ.get("ZENDESK_RCCS_DATA_DIR", "/data"))
         return cls(
-            zendesk_url=os.environ.get("ZENDESK_RCCS_URL", "https://your-subdomain.zendesk.com").rstrip("/"),
+            zendesk_url=os.environ.get("ZENDESK_RCCS_URL", "").rstrip("/"),
             client_identifier=os.environ.get("ZENDESK_RCCS_OAUTH_CLIENT_IDENTIFIER", "").strip(),
             client_secret=read_secret("ZENDESK_RCCS_OAUTH_CLIENT_SECRET"),
             token_bundle_file=Path(os.environ.get(

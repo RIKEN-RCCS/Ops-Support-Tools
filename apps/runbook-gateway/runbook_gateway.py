@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 
-DEFAULT_API_URL = os.environ.get("RUNBOOK_GATEWAY_KNOWLEDGE_API_URL", "https://support.example.com")
+DEFAULT_API_URL = os.environ.get("RUNBOOK_GATEWAY_KNOWLEDGE_API_URL", "")
 DEFAULT_TOKEN_FILE = os.environ.get("RUNBOOK_GATEWAY_TOKEN_FILE", "/run/secrets/knowledge_write_token")
 DEFAULT_MACHINE = os.environ.get("RUNBOOK_GATEWAY_MACHINE", "")
 DEFAULT_ENVIRONMENT = os.environ.get("RUNBOOK_GATEWAY_ENVIRONMENT", "")
@@ -285,6 +285,8 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
+    if not args.api:
+        parser.error("--api or RUNBOOK_GATEWAY_KNOWLEDGE_API_URL is required")
     args.func(args)
 
 

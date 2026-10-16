@@ -1,6 +1,6 @@
 # zendesk_rccs
 
-`apps/zendesk-support-ai` から R-CCS Zendesk API を使うための OAuth 中継サーバです。
+`apps/zendesk-support-ai` から サポート用Zendesk API を使うための OAuth 中継サーバです。
 
 Support AI worker には Zendesk OAuth access token / refresh token を渡しません。worker は Docker 内部ネットワークでこの relay に Bearer token を付けてアクセスし、relay だけが Zendesk OAuth token bundle を保持・更新します。
 
@@ -11,7 +11,7 @@ zendesk-support-ai worker
   -> http://zendesk-rccs:8080/api/v2/...
   -> relay token check
   -> OAuth refresh if needed
-  -> R-CCS Zendesk API
+  -> サポート用Zendesk API
 ```
 
 OAuth refresh は次の2経路で実行します。
@@ -54,11 +54,11 @@ ZENDESK_RCCS_RELAY_TOKEN_FILE=/run/secrets/zendesk_rccs_relay_token
 
 初回の OAuth token bundle は `apps/zendesk-oauth-tools/` の authorization code flow で作成し、`apps/zendesk_rccs/data/zendesk_oauth_token_bundle.json` に配置します。
 
-`apps/zendesk-oauth-tools/.env` を一時的に R-CCS 用へ向ける場合は、少なくとも次の値を R-CCS 用にします。
+`apps/zendesk-oauth-tools/.env` を一時的に サポート用へ向ける場合は、少なくとも次の値を サポート用にします。
 
 ```text
 ZENDESK_URL=https://your-subdomain.zendesk.com
-ZENDESK_OAUTH_CLIENT_IDENTIFIER=<R-CCS OAuth client identifier>
+ZENDESK_OAUTH_CLIENT_IDENTIFIER=<OAuth client identifier>
 ZENDESK_OAUTH_CLIENT_SECRET_FILE=apps/zendesk_rccs/secrets/zendesk_rccs_oauth_client_secret
 ZENDESK_OAUTH_TOKEN_BUNDLE_FILE=apps/zendesk_rccs/data/zendesk_oauth_token_bundle.json
 ZENDESK_OAUTH_SCOPES=read write

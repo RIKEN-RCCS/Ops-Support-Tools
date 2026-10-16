@@ -47,6 +47,10 @@ install -o root -g support-ai-runbook -m 640 knowledge_write_token /etc/support-
 
 `knowledge_write_token` must match `KNOWLEDGE_API_WRITE_TOKEN_FILE` configured on the central Knowledge API.
 
+## Endpoint Configuration
+
+Set `RUNBOOK_GATEWAY_KNOWLEDGE_API_URL` in private operator configuration or pass `--api https://knowledge.example.com`. No production endpoint is built in. Existing wrappers must receive this setting before upgrading.
+
 ## Commands
 
 Claim the oldest suitable `review_passed` real-machine task run:

@@ -9,7 +9,7 @@ HPC/AI 計算基盤の運用とユーザーサポートを支援するツール�
 | App | Role |
 |---|---|
 | [`apps/zendesk-support-ai`](apps/zendesk-support-ai) | Zendesk チケットの一次トリアージ、追加質問ドラフト、担当候補の決定、内部メモ投稿 |
-| [`apps/zendesk_rccs`](apps/zendesk_rccs) | `zendesk-support-ai` が R-CCS Zendesk API を OAuth で使うための内部 relay |
+| [`apps/zendesk_rccs`](apps/zendesk_rccs) | `zendesk-support-ai` が サポート用Zendesk API を OAuth で使うための内部 relay |
 | [`apps/knowledge-api`](apps/knowledge-api) | 暗号化SQLiteによる知見・調査ケース・実機runbook・調査結果・書類受け渡し API |
 | [`apps/runbook-gateway`](apps/runbook-gateway) | 実機側Apptainer CLI gateway。許可グループの人間/AIが実機runbook taskをclaimし、結果をKnowledgeへ戻す |
 

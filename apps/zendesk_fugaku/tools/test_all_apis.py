@@ -17,8 +17,6 @@ import urllib.parse
 import urllib.request
 import uuid
 
-DEFAULT_BASE = 'https://support.example.com/zendesk_fugaku'
-
 
 class TestFailure(Exception):
     pass
@@ -184,7 +182,7 @@ class Suite:
         if nxt:
             parsed = urllib.parse.urlsplit(nxt)
             api_path = '/api/v2/' + path
-            if (parsed.scheme != 'https' or parsed.netloc != 'your-subdomain.zendesk.com'
+            if (parsed.scheme != 'https' or parsed.netloc != urllib.parse.urlsplit(self.state.get('upstream_url', '')).netloc
                     or parsed.path not in (api_path, api_path[:-5])):
                 raise TestFailure('unexpected pagination URL; not followed')
             second = self.call('GET', path, urllib.parse.parse_qsl(parsed.query, keep_blank_values=True))
@@ -370,7 +368,8 @@ class Suite:
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--token-file', required=True, type=Path)
-    parser.add_argument('--base-url', default=None)
+    parser.add_argument('--base-url', default=os.environ.get('ZENDESK_RELAY_TEST_BASE_URL'))
+    parser.add_argument('--upstream-url', default=os.environ.get('ZENDESK_RELAY_TEST_UPSTREAM_URL'))
     parser.add_argument('--output-dir', type=Path, help='new private directory (must not exist)')
     parser.add_argument('--cleanup-only', type=Path, metavar='STATE_JSON')
     parser.add_argument('--job-timeout', type=float, default=180)
@@ -378,6 +377,12 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.job_timeout <= 0 or args.poll_interval <= 0:
         parser.error('timeouts must be positive')
+    if not args.cleanup_only and (not args.base_url or not args.upstream_url):
+        parser.error('--base-url and --upstream-url (or their environment settings) are required')
+    if args.upstream_url:
+        origin = urllib.parse.urlsplit(args.upstream_url)
+        if origin.scheme != 'https' or not origin.netloc or origin.username or origin.password or origin.path not in ('', '/') or origin.query or origin.fragment:
+            parser.error('--upstream-url must be an HTTPS origin without credentials')
     try:
         token = args.token_file.read_text().strip()
         if not token or any(c.isspace() for c in token):
@@ -393,12 +398,12 @@ def main(argv=None):
             parser.error('cleanup base URL must match saved state')
         base = state['base_url']
     else:
-        base = (args.base_url or DEFAULT_BASE).rstrip('/')
+        base = args.base_url.rstrip('/')
         run_id = 'zrelaytest-' + datetime.datetime.now().strftime('%Y%m%d') + '-' + uuid.uuid4().hex[:12]
         directory = (args.output_dir or Path(run_id)).resolve()
         directory.mkdir(mode=0o700, parents=False, exist_ok=False)
         state_file = directory/'state.json'
-        state = {'run_id':run_id,'base_url':base,'users':[],'organizations':[],
+        state = {'run_id':run_id,'base_url':base,'upstream_url':args.upstream_url.rstrip('/'),'users':[],'organizations':[],
                  'pending_jobs':[],'unresolved_creates':{},'creation_attempted':False,'cleanup_complete':False}
     suite = Suite(API(base,token),state,state_file,args.job_timeout,args.poll_interval)
     suite.save()

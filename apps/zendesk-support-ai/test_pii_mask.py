@@ -1,14 +1,14 @@
-"""pii_mask の単体テスト(LLM 不要 — offline validation 受け入れ条件)。"""
+"""pii_mask の単体テスト(LLM 不要 受け入れ条件)。"""
 
 import pii_mask
 
 
 def test_basic_mask_unmask():
-    text = ("田中のアドレス tanaka@example.jp に連絡。サーバ 192.168.10.5 で /home/tanaka が壊れ、"
+    text = ("田中のアドレス user@example.com に連絡。サーバ 192.168.10.5 で /home/tanaka が壊れ、"
             "アカウント u01234、電話 03-1234-5678。")
     masked, mapping = pii_mask.mask_text(text)
     # 元の識別子がマスク済みテキストに残っていない
-    for raw in ["tanaka@example.jp", "192.168.10.5", "u01234", "03-1234-5678"]:
+    for raw in ["user@example.com", "192.168.10.5", "u01234", "03-1234-5678"]:
         assert raw not in masked, f"leaked: {raw}"
     # /home/ の構造は保持、ユーザー名のみ置換
     assert "/home/[USER_1]" in masked, masked
@@ -17,7 +17,7 @@ def test_basic_mask_unmask():
 
 
 def test_consistent_token_same_value():
-    text = "user@x.jp が user@x.jp に2回出る"
+    text = "user@example.org が user@example.org に2回出る"
     masked, mapping = pii_mask.mask_text(text)
     # 同一値は同一トークン -> EMAIL は1種類だけ
     emails = {tok for tok in mapping if tok.startswith("[EMAIL")}
@@ -26,16 +26,16 @@ def test_consistent_token_same_value():
 
 
 def test_consistent_across_fields():
-    fields = ["件名 a@b.jp", "本文でも a@b.jp と c@d.jp"]
+    fields = ["件名 a@example.com", "本文でも a@example.com と c@example.org"]
     masked, mapping = pii_mask.mask_fields(fields)
-    tok_ab = mapping_inv(mapping)["a@b.jp"]
+    tok_ab = mapping_inv(mapping)["a@example.com"]
     # フィールドをまたいでも同一トークン
     assert tok_ab in masked[0] and tok_ab in masked[1]
     assert len([t for t in mapping if t.startswith("[EMAIL")]) == 2
 
 
 def test_unresolved_placeholder_detection():
-    _, mapping = pii_mask.mask_text("a@b.jp")
+    _, mapping = pii_mask.mask_text("a@example.com")
     # LLM が捏造した [EMAIL_9] は対応表に無い
     assert pii_mask.has_unresolved_placeholders("ここに [EMAIL_9] が混入", mapping)
     # 既知トークンだけなら False

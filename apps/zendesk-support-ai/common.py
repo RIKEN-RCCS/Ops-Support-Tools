@@ -25,10 +25,11 @@ from urllib.parse import urlparse
 import requests
 
 from secret_config import env_secret
+import site_policy
 import spool_crypto
 
 # --------------------------------------------------------------------------
-# 設定(すべて環境変数経由。秘密情報はコードに直書きしない — documented behavior)
+# 設定(すべて環境変数経由。秘密情報はコードに直書きしない)
 # --------------------------------------------------------------------------
 
 # スプールの既定値はこのリポジトリ配下(spool)。
@@ -71,12 +72,12 @@ AGENTS_TEMPLATE_FILE = Path(os.environ.get(
 ))
 ASSIGNEE_FIELD_ID_ENV = os.environ.get("SUPPORT_AI_ASSIGNEE_FIELD_ID", "").strip()
 KNOWLEDGE_API_URL = os.environ.get("SUPPORT_AI_KNOWLEDGE_API_URL", "").rstrip("/")
-SPECIAL_SUPPORT_AREA = os.environ.get("SUPPORT_AI_SPECIAL_SUPPORT_AREA", "special").strip().lower()
-SPECIAL_AGENT_TAG = os.environ.get("SUPPORT_AI_SPECIAL_AGENT_TAG", "special_support").strip()
-SPECIAL_GROUP_ID_ENV = os.environ.get("SUPPORT_AI_SPECIAL_GROUP_ID", "").strip()
-SPECIAL_GROUP_NAME = os.environ.get("SUPPORT_AI_SPECIAL_GROUP_NAME", "SPECIAL").strip()
-PASSKEY_SUPPORT_AREA = os.environ.get("SUPPORT_AI_PASSKEY_SUPPORT_AREA", "passkey").strip().lower()
-PASSKEY_AGENT_TAG = os.environ.get("SUPPORT_AI_PASSKEY_AGENT_TAG", "authentication_support").strip()
+SPECIAL_SUPPORT_AREA = os.environ.get("SUPPORT_AI_SPECIAL_SUPPORT_AREA", site_policy.SPECIAL_SUPPORT_AREA).strip().lower()
+SPECIAL_AGENT_TAG = os.environ.get("SUPPORT_AI_SPECIAL_AGENT_TAG", site_policy.SPECIAL_AGENT_TAG).strip()
+SPECIAL_GROUP_ID_ENV = os.environ.get("SUPPORT_AI_SPECIAL_GROUP_ID", site_policy.SPECIAL_GROUP_ID).strip()
+SPECIAL_GROUP_NAME = os.environ.get("SUPPORT_AI_SPECIAL_GROUP_NAME", site_policy.SPECIAL_GROUP_NAME).strip()
+PASSKEY_SUPPORT_AREA = os.environ.get("SUPPORT_AI_PASSKEY_SUPPORT_AREA", site_policy.PASSKEY_SUPPORT_AREA).strip().lower()
+PASSKEY_AGENT_TAG = os.environ.get("SUPPORT_AI_PASSKEY_AGENT_TAG", site_policy.PASSKEY_AGENT_TAG).strip()
 
 
 def log(*args: Any) -> None:
@@ -482,7 +483,7 @@ def search_tickets(query: str) -> List[Dict[str, Any]]:
 def fetch_ticket_comments(ticket_id: int) -> List[Dict[str, Any]]:
     """チケットのコメントを取得(読み取り専用)。
 
-    audit ではなく Comments API を使う(audit の metadata には IP 等が含まれるため — documented behavior)。
+    audit ではなく Comments API を使う(audit の metadata には IP 等が含まれるため)。
     """
     out: List[Dict[str, Any]] = []
     path = f"/api/v2/tickets/{ticket_id}/comments.json"
@@ -881,7 +882,7 @@ def write_roundrobin(cursor: int, *, base: Optional[Path] = None, pool: str = "d
 def set_assignee_field(ticket_id: int, agent_id: int) -> Dict[str, Any]:
     """カスタムフィールド「担当者」にライトエージェント ID をセットする。
 
-    assignment behaviorの例外的な 2 つ目の書き込み操作。
+    明示された専用の書き込み操作。
     assignee(標準の担当者)変更・クローズ・公開返信は依然として行わない。
     書き込む値は呼び出し側で allowlist 検証済みのライトエージェント ID であることを前提とする。
     ASSIGNEE_FIELD_ID(=agents.json の assignee_field_id)未設定なら書き込まない。
@@ -913,7 +914,7 @@ def set_ticket_assignee(ticket_id: int, agent_id: int, *, group_id: Optional[int
 def post_internal_note(ticket_id: int, body: str, tags: Optional[List[str]] = None) -> Dict[str, Any]:
     """当該チケットへ内部メモ(public:false)を追記し、タグを付与する。
 
-    documented behavior: クローズ/アサイン/公開返信は行わない。
+    クローズ/アサイン/公開返信は行わない。
     """
     comment: Dict[str, Any] = {"body": body, "public": False}
     ticket_update: Dict[str, Any] = {"comment": comment}
