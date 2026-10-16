@@ -754,6 +754,34 @@ def chat_json_relaxed(
     return _coerce_json_schema_defaults(parsed, schema)
 
 
+def enforce_answer_gate(result: Dict[str, Any], *, followup: bool = False) -> Dict[str, Any]:
+    """Resolve cross-field contradictions conservatively; never promote a reply to safe.
+
+    JSON Schema validates individual fields, not their relationships. Keep the
+    model's confidence and investigation requirements as evidence, but hold drafts
+    that still need evidence or review. Invalid/missing required gate fields also
+    fail closed. This does not itself create or complete an investigation case.
+    """
+    reasons = []
+    required_false = ["requires_environment_knowledge", "requires_runbook"]
+    required_false += ["needs_agent_review"] if followup else ["requires_operator_check"]
+    for key in required_false:
+        if result.get(key) is not False:
+            reasons.append(key)
+    if result.get("answer_confidence") not in ("medium", "high"):
+        reasons.append("answer_confidence")
+    if result.get("safe_to_reply_to_user") is not True:
+        reasons.append("safe_to_reply_to_user")
+    if followup and result.get("answerable") is not True:
+        reasons.append("answerable")
+    if reasons:
+        result["safe_to_reply_to_user"] = False
+        if followup:
+            result["answerable"] = False
+            result["needs_agent_review"] = True
+    return result
+
+
 def triage(masked_subject: str, masked_body: str, *, model: Optional[str] = None) -> Dict[str, Any]:
     """マスク済みテキストからトリアージ結果(SUPPORT_AI_TRIAGE_SCHEMA)を生成する。
 
@@ -811,6 +839,7 @@ def triage(masked_subject: str, masked_body: str, *, model: Optional[str] = None
     for m in candidates:
         try:
             result = chat_json(system, user, SUPPORT_AI_TRIAGE_SCHEMA, model=m)
+            enforce_answer_gate(result)
             # 実際に使ったモデル名を付与(フォールバックで変わりうるため)
             result["_model"] = m
             return result
@@ -862,6 +891,7 @@ def followup_reply(
     for m in candidates:
         try:
             result = chat_json(system, user, FOLLOWUP_SCHEMA, model=m, schema_name="followup")
+            enforce_answer_gate(result, followup=True)
             result["_model"] = m
             return result
         except Exception as e:  # noqa: BLE001

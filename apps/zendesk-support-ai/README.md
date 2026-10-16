@@ -255,6 +255,10 @@ suggested_next_action
 
 `safe_to_reply_to_user=false` の場合、社内メモでは一次返信ドラフトを「公開返信への利用は保留」として表示します。環境固有の module、CUDA、MPI、コンパイラ、ストレージ、ジョブ実行環境、サポート範囲などが必要な問い合わせでは、ユーザーへ一般論を返す前に担当者が Knowledge と必要な investigation task で確認します。
 
+初回・追加質問とも、LLM出力の型検証に加えてコード側で回答ゲートの整合性を確認します。環境固有知識・調査・担当者確認が必要、回答確信度がlow、またはモデル自身が回答を保留した場合は、`safe_to_reply_to_user=false`を優先します。追加質問では`answerable=false`または`needs_agent_review=true`も保留条件とし、保留時はこの2項目もそれぞれfalse/trueに統一します。必要なゲート項目の欠落・不正値も保留します。モデルの調査要否や確信度は保持し、安全判定をfalseからtrueへ引き上げません。既存の保存済みメモを遡って変更する処理はありません。
+
+回帰テスト: `python -m unittest -v test_answer_gate.py`（外部API呼出しなし）。
+
 `SUPPORT_AI_KNOWLEDGE_API_URL` が設定され、`SUPPORT_AI_CREATE_KNOWLEDGE_RUNS=1` の場合、`requires_runbook=true` または `requires_environment_knowledge=true` のtriageは Knowledge API に親の **investigation case** を作ります。この親caseは、すぐ実機runbookを生成するための `requested` ではなく、まず `routing_requested` になります。`investigation-router-worker` は `routing_requested` のcase本文と添付済みの case decision / answer evaluation / execution result を読み、DB/Knowledge検索、実機調査、人の方針判断へ分解します。同じ `ticket_id` に未完了のcaseがある場合は、decision agent が「既存caseへ文脈を attach するだけでよいか」「より深く/広く/作り直しの新規調査taskが必要か」「調査不要か」「担当者判断へ戻すか」を判定します。判定結果は `case-decision` document として Knowledge に残します。attach は同じrunbookの再実行を意味しません。
 
 Followup responder も同じゲートと decision agent を使います。公開会話履歴を LLM に渡すときは Zendesk user id / author_id を渡さず、`speaker=end_user` または `speaker=support` のみを使います。decision agent の `case_change` は `none`、`append_context`、`deepen`、`broaden`、`replace`、`initial` のいずれかです。
