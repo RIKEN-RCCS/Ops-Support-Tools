@@ -14,6 +14,7 @@ class WithoutLLMTests(unittest.TestCase):
             'SUPPORT_AI_STARTUP_LLM_CHECKS': '0',
             'SUPPORT_AI_SYNC_AGENTS_ON_STARTUP': '0',
         }), patch.object(startup.common, 'ensure_spool_dirs'), \
+                patch.object(startup.common, 'check_queue_writable'), \
                 patch.object(startup.common, 'ensure_agents_file'), \
                 patch.object(startup.common, 'zendesk_healthcheck', return_value={}) as zendesk, \
                 patch.object(startup.llm_client, 'healthcheck') as llm:
@@ -26,6 +27,7 @@ class WithoutLLMTests(unittest.TestCase):
             'SUPPORT_AI_STARTUP_CHECKS': '1',
             'SUPPORT_AI_STARTUP_RETRIES': '1',
         }), patch.object(startup.common, 'ensure_spool_dirs'), \
+                patch.object(startup.common, 'check_queue_writable'), \
                 patch.object(startup.common, 'ensure_agents_file'), \
                 patch.object(startup.common, 'zendesk_healthcheck', return_value={}), \
                 patch.object(startup.llm_client, 'healthcheck', side_effect=RuntimeError('offline')):

@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import os
 import time
+import uuid
 
 import common
 import llm_client
@@ -210,7 +211,7 @@ def _resolved_support_area(event: dict, triage: dict) -> tuple[str, str, str]:
     return "general", "default_general", str(triage.get("support_area_reason") or "")
 
 
-def _create_knowledge_run(ticket_id: int, triage: dict, *, environment: str = "", machine: str = "") -> tuple[str | None, str | None, str, str]:
+def _create_knowledge_run(ticket_id: int, triage: dict, *, environment: str = "", machine: str = "", event_key: str = "") -> tuple[str | None, str | None, str, str]:
     if not CREATE_KNOWLEDGE_RUNS or not common.knowledge_enabled():
         return None, None, "no_runbook_needed", "none"
     if not (triage.get("requires_runbook") or triage.get("requires_environment_knowledge")):
@@ -226,6 +227,13 @@ def _create_knowledge_run(ticket_id: int, triage: dict, *, environment: str = ""
         "summary": triage.get("summary", ""),
     }
     try:
+        if event_key:
+            payload["id"] = str(uuid.uuid5(uuid.NAMESPACE_URL, "support-ai-triage:" + event_key))
+            prior = common.knowledge_find_run(payload["id"])
+            if prior:
+                if prior.get("ticket_id") != ticket_id or prior.get("task_type") != "investigation_case":
+                    raise RuntimeError("triage event ID conflicts with another case")
+                return str(prior["id"]), None, "attach_to_existing_run", "none"
         created_case_change = "initial"
         existing = common.knowledge_find_requested_run(ticket_id)
         if existing and existing.get("id"):
@@ -252,7 +260,15 @@ def _create_knowledge_run(ticket_id: int, triage: dict, *, environment: str = ""
             payload["runbook"] = _runbook_with_decision_delta(triage, decision)
             payload["summary"] = f"{triage.get('summary', '')} ({case_change})"
             created_case_change = case_change
-        created = common.knowledge_create_run(payload)
+        try:
+            created = common.knowledge_create_run(payload)
+        except Exception:
+            # A timeout may occur after INSERT committed. The primary key also
+            # prevents duplicate creation by concurrent/retried requests.
+            prior = common.knowledge_find_run(payload["id"]) if event_key else None
+            if not prior or prior.get("ticket_id") != ticket_id or prior.get("task_type") != "investigation_case":
+                raise
+            created = {"run": prior}
         run = created.get("run") if isinstance(created, dict) else {}
         run_id = run.get("id") if isinstance(run, dict) else None
         return str(run_id) if run_id else None, None, "open_new_investigation", created_case_change
@@ -343,6 +359,7 @@ def process_one(path, verbose: bool = False) -> bool:
         common.log(f"generating ticket_{ticket_id}")
 
     try:
+        common.check_queue_writable()
         subject, bodies, already = _extract_texts(ticket_id)
         if already:
             # 既に投稿済み。生成せず incoming から取り除く(LLM 呼び出しも省く)
@@ -372,6 +389,7 @@ def process_one(path, verbose: bool = False) -> bool:
             triage,
             environment=environment,
             machine=machine,
+            event_key=f"{ticket_id}:{event.get('source', 'webhook')}:{event.get('received_at', 'legacy')}",
         )
         if knowledge_run_error and verbose:
             common.log(f"knowledge run create failed ticket_{ticket_id}: {knowledge_run_error}")

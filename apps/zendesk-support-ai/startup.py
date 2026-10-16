@@ -40,6 +40,7 @@ def preflight() -> None:
     delay = float(os.environ.get("SUPPORT_AI_STARTUP_RETRY_DELAY", "5"))
 
     common.ensure_spool_dirs()
+    _retry("queue write", common.check_queue_writable, retries=retries, delay=delay)
     common.log(f"startup ok: spool ready at {common.SPOOL_DIR}")
 
     agents_file = common.ensure_agents_file()

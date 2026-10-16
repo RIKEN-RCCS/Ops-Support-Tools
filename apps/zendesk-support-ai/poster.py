@@ -275,6 +275,7 @@ def process_one(path, *, dry_run: bool, verbose: bool = False) -> bool:
 
 def run_once(*, dry_run: bool, verbose: bool = False) -> int:
     common.ensure_spool_dirs()
+    common.check_queue_writable()
     files = common.list_queue("pending", "ticket_*.json")
     if files and SYNC_AGENTS_ON_POST:
         try:

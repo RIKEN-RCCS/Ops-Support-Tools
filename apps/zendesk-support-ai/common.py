@@ -97,12 +97,35 @@ class QueueItem:
         delete_queue_item(self)
 
 
+class _QueueConnection(sqlite3.Connection):
+    """SQLite's normal context manager commits but does not close connections."""
+
+    def __exit__(self, *args):
+        try:
+            return super().__exit__(*args)
+        finally:
+            self.close()
+
+
 def _queue_conn() -> sqlite3.Connection:
     QUEUE_DB.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(QUEUE_DB)
+    conn = sqlite3.connect(QUEUE_DB, factory=_QueueConnection)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+    except Exception:
+        conn.close()
+        raise
     return conn
+
+
+def check_queue_writable() -> None:
+    """Require a write transaction before external side effects; change no rows."""
+    _init_queue_db()
+    with _queue_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("UPDATE queue_items SET updated_at = updated_at WHERE 0")
+        conn.rollback()
 
 
 def _init_queue_db() -> None:
@@ -1035,9 +1058,19 @@ def knowledge_worker_claim_run(
 
 
 def knowledge_find_requested_run(ticket_id: int) -> Optional[Dict[str, Any]]:
-    """同じ Zendesk ticket の未完了 requested run を1件返す。"""
-    runs = knowledge_list_runs(ticket_id=ticket_id, status="requested", limit=20)
-    return runs[0] if runs else None
+    """Return an active parent case, including current routing/review states."""
+    runs = knowledge_list_runs(ticket_id=ticket_id, task_type="investigation_case", limit=200)
+    return next((run for run in runs if not run.get("parent_run_id")
+                 and run.get("status") not in {"closed", "superseded", "done", "task_done"}), None)
+
+
+def knowledge_find_run(run_id: str) -> Optional[Dict[str, Any]]:
+    resp = requests.get(KNOWLEDGE_API_URL + f"/api/runs/{run_id}",
+                        headers={"Accept": "application/json"}, timeout=HTTP_TIMEOUT)
+    if resp.status_code == 404:
+        return None
+    resp.raise_for_status()
+    return resp.json().get("run")
 
 
 def knowledge_get_run(run_id: str) -> Dict[str, Any]:

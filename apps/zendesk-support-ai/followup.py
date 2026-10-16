@@ -178,6 +178,7 @@ def process_one(path, verbose: bool = False) -> bool:
 
 def run_once(verbose: bool = False) -> int:
     common.ensure_spool_dirs()
+    common.check_queue_writable()
     files = common.list_queue("incoming_followup", "ticket_*.json")
     n = 0
     for path in files:

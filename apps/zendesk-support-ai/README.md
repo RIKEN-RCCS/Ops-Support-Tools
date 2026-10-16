@@ -447,6 +447,27 @@ docker compose exec -T generator python eval_runbook_llm.py --relaxed-json --mod
 
 ## Monitor
 
+Run SQLite checks with the application UID, inside the container:
+
+```bash
+docker compose exec -T webhook python queue_status.py
+```
+
+This checks a write transaction without changing rows, integrity, and queue
+counts, without reading payloads. Do not open the live SQLite database from a
+different host UID: even a read-only connection may create WAL/SHM sidecars
+whose permissions prevent the application from writing. Do not delete live
+WAL/SHM files. Startup and queue-consuming workers check write access before
+external side effects, and queue connection contexts explicitly close their
+connections.
+
+Triage derives its Knowledge case ID from the ticket and queue event identity.
+A retry reuses that case even if routing/review has already advanced; a lost
+create response is recovered by looking up the same ID. Active-case lookup
+also includes modern routing/review states, rather than only legacy `requested`.
+This does not provide a distributed transaction with Zendesk posting: an
+ambiguous Zendesk write response still requires reconciliation before replay.
+
 ### Webhook availability during an LLM outage
 
 The webhook process does not call the LLM: triage/followup enqueue work, while
