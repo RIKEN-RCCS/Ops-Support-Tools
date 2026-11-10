@@ -16,6 +16,7 @@ import sqlite3
 import sys
 import tempfile
 import time
+import uuid
 from dataclasses import dataclass
 from fnmatch import fnmatch
 from pathlib import Path
@@ -1058,11 +1059,73 @@ def knowledge_worker_claim_run(
     return run
 
 
+def knowledge_case_event_id(source: str, event_key: str) -> str:
+    if source not in {"triage", "followup"} or not isinstance(event_key, str) or not event_key:
+        raise ValueError("stable_case_event_required")
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, "support-ai-case:" + source + ":" + event_key))
+
+
+def _case_transition_headers() -> dict[str, str]:
+    headers = {"Accept": "application/json", "Content-Type": "application/json"}
+    token = env_secret("KNOWLEDGE_API_WRITE_TOKEN")
+    if token:
+        headers["Authorization"] = "Bearer " + token
+    return headers
+
+
+def knowledge_find_case_transition(event_id: str, ticket_id: int) -> Optional[Dict[str, Any]]:
+    response = requests.get(KNOWLEDGE_API_URL + "/api/cases/transitions/" + event_id,
+        headers=_case_transition_headers(), timeout=HTTP_TIMEOUT, allow_redirects=False)
+    if response.status_code == 404:
+        return None
+    if response.status_code != 200:
+        raise RuntimeError("case_transition_lookup_unavailable")
+    value = response.json()
+    run = value.get("run")
+    if (value.get("event_id") != event_id or value.get("ticket_id") != ticket_id or
+            not isinstance(run, dict) or run.get("ticket_id") != ticket_id or
+            run.get("task_type") != "investigation_case"):
+        raise RuntimeError("case_transition_receipt_mismatch")
+    return run
+
+
+def knowledge_transition_case(payload: Dict[str, Any], event_id: str,
+                              existing: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    request = dict(event_id=event_id, mode="replace" if existing else "create",
+        old_case_id=str(existing["id"]) if existing else "",
+        old_case_version=str(existing.get("case_version") or "") if existing else "",
+        run={k:v for k,v in payload.items() if k != "id"})
+    try:
+        response = requests.post(KNOWLEDGE_API_URL + "/api/cases/transitions", json=request,
+            headers=_case_transition_headers(), timeout=HTTP_TIMEOUT, allow_redirects=False)
+    except requests.RequestException:
+        # Read the receipt, never retry a possibly committed POST.
+        try:
+            recovered = knowledge_find_case_transition(event_id, payload['ticket_id'])
+        except Exception:
+            recovered = None
+        if recovered is not None:
+            return {"run": recovered, "replay": True}
+        raise RuntimeError("case_transition_outcome_unknown") from None
+    if response.status_code not in (200, 201):
+        raise RuntimeError("case_transition_conflict_or_unavailable")
+    result = response.json()
+    run = result.get("run")
+    if (not isinstance(run, dict) or run.get("ticket_id") != payload.get("ticket_id") or
+            run.get("task_type") != "investigation_case"):
+        raise RuntimeError("case_transition_response_mismatch")
+    return result
+
+
 def knowledge_find_requested_run(ticket_id: int) -> Optional[Dict[str, Any]]:
     """Return an active parent case, including current routing/review states."""
     runs = knowledge_list_runs(ticket_id=ticket_id, task_type="investigation_case", limit=200)
-    return next((run for run in runs if not run.get("parent_run_id")
-                 and run.get("status") not in {"closed", "superseded", "done", "task_done"}), None)
+    current = [run for run in runs if not run.get("parent_run_id")
+               and run.get("status") not in {"closed", "superseded", "done", "task_done"}]
+    if len(runs) >= 200 or len(current) > 1:
+        raise RuntimeError("current_case_set_ambiguous")
+    return current[0] if current else None
+
 
 
 def knowledge_find_run(run_id: str) -> Optional[Dict[str, Any]]:

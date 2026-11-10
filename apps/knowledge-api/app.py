@@ -16,6 +16,7 @@ from typing import Any
 from flask import Flask, jsonify, redirect, render_template_string, request, url_for
 
 import field_crypto
+import case_lifecycle
 
 DB_PATH = Path(os.environ.get("KNOWLEDGE_DB", "/data/db.sqlite"))
 WRITE_TOKEN_FILE = os.environ.get("KNOWLEDGE_API_WRITE_TOKEN_FILE", "")
@@ -319,6 +320,7 @@ def _connect() -> sqlite3.Connection:
 
 def _init_db() -> None:
     with _connect() as conn:
+        conn.execute(case_lifecycle.SCHEMA)
         conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS documents (
@@ -483,6 +485,8 @@ def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
 
 def _run_row_to_dict(row: sqlite3.Row, *, include_claim_token: bool = False) -> dict[str, Any]:
     data = dict(row)
+    if data.get("task_type") == "investigation_case":
+        data["case_version"] = case_lifecycle.version(data)
     data["runbook"] = _decrypt_field(data.get("runbook_ciphertext", ""), data.get("runbook", ""))
     data["issue_on_run"] = _decrypt_field(data.get("issue_on_run_ciphertext", ""), data.get("issue_on_run", ""))
     data["summary"] = _decrypt_field(data.get("summary_ciphertext", ""), data.get("summary", ""))
@@ -2820,7 +2824,7 @@ def _create_document_handoff(
     }
 
 
-def _create_run_record(payload: dict[str, Any]) -> dict[str, Any]:
+def _prepare_run_record(payload: dict[str, Any]) -> dict[str, Any]:
     run_id = str(payload.get("id") or uuid.uuid4())
     now = _now()
     key = field_crypto.load_key()
@@ -2866,21 +2870,36 @@ def _create_run_record(payload: dict[str, Any]) -> dict[str, Any]:
         "created_at": now,
         "updated_at": now,
     }
+    return record
+
+
+def _insert_run_record(conn, record):
+    conn.execute(
+        """
+        INSERT INTO runs
+          (id, parent_run_id, ticket_id, task_type, task_priority, required_capabilities_json,
+           executor_mode, risk_level, approval_required, environment, machine, runbook, runbook_ciphertext, status,
+           issue_on_run, issue_on_run_ciphertext, summary, summary_ciphertext, created_at, updated_at)
+        VALUES
+          (:id, :parent_run_id, :ticket_id, :task_type, :task_priority, :required_capabilities_json,
+           :executor_mode, :risk_level, :approval_required, :environment, :machine, :runbook, :runbook_ciphertext, :status,
+           :issue_on_run, :issue_on_run_ciphertext, :summary, :summary_ciphertext, :created_at, :updated_at)
+        """,
+        record,
+    )
+
+
+def _create_run_record(payload: dict[str, Any]) -> dict[str, Any]:
+    record = _prepare_run_record(payload)
     with _connect() as conn:
-        conn.execute(
-            """
-            INSERT INTO runs
-              (id, parent_run_id, ticket_id, task_type, task_priority, required_capabilities_json,
-               executor_mode, risk_level, approval_required, environment, machine, runbook, runbook_ciphertext, status,
-               issue_on_run, issue_on_run_ciphertext, summary, summary_ciphertext, created_at, updated_at)
-            VALUES
-              (:id, :parent_run_id, :ticket_id, :task_type, :task_priority, :required_capabilities_json,
-               :executor_mode, :risk_level, :approval_required, :environment, :machine, :runbook, :runbook_ciphertext, :status,
-               :issue_on_run, :issue_on_run_ciphertext, :summary, :summary_ciphertext, :created_at, :updated_at)
-            """,
-            record,
-        )
-    return _run_row_to_dict(record)
+        if record['task_type'] == 'investigation_case':
+            conn.execute('BEGIN IMMEDIATE')
+            current = conn.execute("SELECT 1 FROM runs WHERE ticket_id=? AND task_type='investigation_case' AND parent_run_id='' AND status NOT IN ('closed','superseded','done','task_done') LIMIT 1", (record['ticket_id'],)).fetchone()
+            if current:
+                raise case_lifecycle.Conflict('current_case_already_exists')
+        _insert_run_record(conn, record)
+        row = conn.execute("SELECT * FROM runs WHERE id = ?", (record["id"],)).fetchone()
+    return _run_row_to_dict(row)
 
 
 @app.post("/runs/<run_id>/operator-action")
@@ -3627,12 +3646,47 @@ def update_document_handoff(handoff_id: str):
     return jsonify({"ok": True, "handoff": _handoff_row_to_dict(row)})
 
 
+@app.post("/api/cases/transitions")
+def transition_case():
+    auth_error = _check_write_token()
+    if auth_error is not None:
+        return auth_error
+    _init_db()
+    try:
+        with _connect() as conn:
+            row, replay = case_lifecycle.transition(conn, request.get_json(silent=True),
+                _prepare_run_record, _insert_run_record, field_crypto.encrypt_text, field_crypto.decrypt_text)
+        return jsonify(ok=True, run=_run_row_to_dict(row), replay=replay), 200 if replay else 201
+    except case_lifecycle.Conflict as exc:
+        return _json_error(str(exc), 409)
+    except ValueError:
+        return _json_error('invalid_case_transition_request', 400)
+
+
+@app.get("/api/cases/transitions/<event_id>")
+def get_case_transition(event_id: str):
+    auth_error = _check_write_token()
+    if auth_error is not None:
+        return auth_error
+    _init_db()
+    with _connect() as conn:
+        receipt = conn.execute('SELECT * FROM case_transition_requests WHERE event_id=?', (event_id,)).fetchone()
+        if receipt is None:
+            return _json_error('case_transition_not_found', 404)
+        row = conn.execute('SELECT * FROM runs WHERE id=?', (receipt['new_case_id'],)).fetchone()
+    if row is None:
+        return _json_error('case_transition_receipt_inconsistent', 409)
+    return jsonify(ok=True, event_id=event_id, ticket_id=receipt['ticket_id'], run=_run_row_to_dict(row))
+
+
 @app.post("/api/runs")
 def create_run():
     _init_db()
     payload = request.get_json(silent=True) or {}
     try:
         run = _create_run_record(payload)
+    except case_lifecycle.Conflict as exc:
+        return _json_error(str(exc), 409)
     except ValueError as exc:
         return _json_error(str(exc), 400)
     return jsonify({"ok": True, "run": run}), 201

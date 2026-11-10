@@ -176,7 +176,7 @@ def _runbook_with_decision_delta(result: dict[str, Any], decision: dict[str, Any
     )
 
 
-def _create_knowledge_run(ticket_id: int, result: dict[str, Any]) -> tuple[str | None, str | None, str, str]:
+def _create_knowledge_run(ticket_id: int, result: dict[str, Any], *, event_key: str = "") -> tuple[str | None, str | None, str, str]:
     if not CREATE_KNOWLEDGE_RUNS or not common.knowledge_enabled():
         return None, None, "no_runbook_needed", "none"
     if not (result.get("requires_runbook") or result.get("requires_environment_knowledge")):
@@ -190,6 +190,11 @@ def _create_knowledge_run(ticket_id: int, result: dict[str, Any]) -> tuple[str |
         "summary": result.get("summary", ""),
     }
     try:
+        event_id = common.knowledge_case_event_id("followup", event_key)
+        prior = common.knowledge_find_case_transition(event_id, ticket_id)
+        if prior:
+            return str(prior["id"]), None, "attach_to_existing_run", "none"
+        replacing = None
         created_case_change = "initial"
         existing = common.knowledge_find_requested_run(ticket_id)
         if existing and existing.get("id"):
@@ -212,10 +217,16 @@ def _create_knowledge_run(ticket_id: int, result: dict[str, Any]) -> tuple[str |
             if investigation_decision == "operator_review":
                 _attach_decision_document(ticket_id, run_id, result, decision=decision)
                 return run_id, None, investigation_decision, case_change
+            if case_change != "replace":
+                # Parallel/deeper investigations need explicit operator policy;
+                # keep evidence, but never silently create another current parent.
+                _attach_decision_document(ticket_id, run_id, result, decision=decision)
+                return run_id, None, "operator_review", case_change
+            replacing = existing
             payload["runbook"] = _runbook_with_decision_delta(result, decision)
             payload["summary"] = f"{result.get('summary', '')} ({case_change})"
             created_case_change = case_change
-        created = common.knowledge_create_run(payload)
+        created = common.knowledge_transition_case(payload, event_id, replacing)
         run = created.get("run") if isinstance(created, dict) else {}
         run_id = run.get("id") if isinstance(run, dict) else None
         return str(run_id) if run_id else None, None, "open_new_investigation", created_case_change
@@ -329,7 +340,7 @@ def process_one(path, verbose: bool = False) -> bool:
         result = llm_client.followup_reply(masked[0], masked[1], masked[2])
         _validate_result(result)
         model = result.get("_model", "unknown")
-        knowledge_run_id, knowledge_run_error, investigation_decision, case_change = _create_knowledge_run(ticket_id, result)
+        knowledge_run_id, knowledge_run_error, investigation_decision, case_change = _create_knowledge_run(ticket_id, result, event_key=f"{ticket_id}:{comment_id}")
         if knowledge_run_error and verbose:
             common.log(f"followup knowledge run create failed ticket_{ticket_id}: {knowledge_run_error}")
 

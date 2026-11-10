@@ -1,4 +1,5 @@
 import sqlite3
+import uuid
 import tempfile
 import unittest
 from pathlib import Path
@@ -45,35 +46,44 @@ class RecoveryTests(unittest.TestCase):
 
     def test_retry_reuses_event_case_even_after_state_changed(self):
         seen={}
-        def create(payload):
-            seen[payload['id']]=dict(payload)
-            return {'run':seen[payload['id']]}
+        def create(payload, event_id, existing):
+            ident=str(uuid.uuid5(uuid.NAMESPACE_URL,'case-transition:'+event_id))
+            seen[event_id]={**payload,'id':ident}
+            return {'run':seen[event_id]}
         with patch.object(generator,'CREATE_KNOWLEDGE_RUNS',True), \
                 patch.object(common,'knowledge_enabled',return_value=True), \
                 patch.object(generator,'_build_runbook',return_value='test'), \
                 patch.object(common,'knowledge_find_requested_run',return_value=None), \
-                patch.object(common,'knowledge_find_run',side_effect=lambda ident:seen.get(ident)), \
-                patch.object(common,'knowledge_create_run',side_effect=create) as post:
+                patch.object(common,'knowledge_find_case_transition',side_effect=lambda ident,tid:seen.get(ident)), \
+                patch.object(common,'knowledge_transition_case',side_effect=create) as post:
             first=generator._create_knowledge_run(42,{'requires_runbook':True},event_key='42:event:1')
-            seen[first[0]]['status']='answer_review'
+            seen[common.knowledge_case_event_id('triage','42:event:1')]['status']='answer_review'
             second=generator._create_knowledge_run(42,{'requires_runbook':True},event_key='42:event:1')
             self.assertEqual(first[0],second[0]);self.assertIsNone(second[1]);post.assert_called_once()
+            seen[common.knowledge_case_event_id('triage','42:event:1')]['status']='closed'
             third=generator._create_knowledge_run(42,{'requires_runbook':True},event_key='42:event:2')
             self.assertNotEqual(first[0],third[0])
 
     def test_commit_then_timeout_recovers_existing_case(self):
         seen={}
-        def create(payload):
-            seen[payload['id']]=dict(payload)
-            raise TimeoutError('response lost')
+        def post(url, *, json, **kwargs):
+            event_id=json['event_id']
+            seen[event_id]={**json['run'],'id':str(uuid.uuid5(uuid.NAMESPACE_URL,'case-transition:'+event_id))}
+            raise common.requests.Timeout('synthetic response lost')
+        def get(url, **kwargs):
+            event_id=url.rsplit('/',1)[1]
+            row=seen.get(event_id)
+            return Mock(status_code=200 if row else 404,
+                        json=lambda:dict(event_id=event_id,ticket_id=42,run=row))
         with patch.object(generator,'CREATE_KNOWLEDGE_RUNS',True), \
                 patch.object(common,'knowledge_enabled',return_value=True), \
                 patch.object(generator,'_build_runbook',return_value='test'), \
                 patch.object(common,'knowledge_find_requested_run',return_value=None), \
-                patch.object(common,'knowledge_find_run',side_effect=lambda ident:seen.get(ident)), \
-                patch.object(common,'knowledge_create_run',side_effect=create):
+                patch.object(common,'_case_transition_headers',return_value={}), \
+                patch.object(common.requests,'get',side_effect=get), \
+                patch.object(common.requests,'post',side_effect=post) as sending:
             result=generator._create_knowledge_run(42,{'requires_runbook':True},event_key='42:event:1')
-            self.assertIsNone(result[1]);self.assertEqual(len(seen),1)
+            self.assertIsNone(result[1]);self.assertEqual(len(seen),1);sending.assert_called_once()
 
 
 if __name__=='__main__':unittest.main()

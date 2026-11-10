@@ -574,3 +574,24 @@ python3 poster.py --once -v
 python3 test_pii_mask.py
 python3 test_assignment.py
 ```
+
+## Parent-case lifecycle (local implementation; not deployed)
+
+Triage and followup use the same atomic Knowledge case-transition interface.
+Event identities are stable and source-scoped; followup uses the ticket/comment
+identity. A receipt lookup happens before another case decision. After an
+uncertain POST, only a receipt GET is attempted; there is no blind POST retry or
+fallback to the old create endpoint. Unavailable or ambiguous state goes to
+operator review. Duplicate current parents are never resolved by taking the
+first list entry; a full-limit list is treated as incomplete.
+
+`replace` supersedes the old parent and creates its successor atomically.
+`append_context` keeps the current parent. `deepen` and `broaden` preserve the
+decision evidence but require operator review rather than creating another
+current parent without an explicit parallel-investigation policy. Existing
+research, notes and history are retained.
+
+The API and callers must be deployed together after separate approval. The
+caller reads `KNOWLEDGE_API_WRITE_TOKEN` or its `_FILE` variant when configured;
+that access must match the API's existing write-token policy. This local change
+does not copy credentials, alter settings, build images, or deploy services.

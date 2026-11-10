@@ -13,7 +13,6 @@ from __future__ import annotations
 import argparse
 import os
 import time
-import uuid
 
 import common
 import llm_client
@@ -227,13 +226,11 @@ def _create_knowledge_run(ticket_id: int, triage: dict, *, environment: str = ""
         "summary": triage.get("summary", ""),
     }
     try:
-        if event_key:
-            payload["id"] = str(uuid.uuid5(uuid.NAMESPACE_URL, "support-ai-triage:" + event_key))
-            prior = common.knowledge_find_run(payload["id"])
-            if prior:
-                if prior.get("ticket_id") != ticket_id or prior.get("task_type") != "investigation_case":
-                    raise RuntimeError("triage event ID conflicts with another case")
-                return str(prior["id"]), None, "attach_to_existing_run", "none"
+        event_id = common.knowledge_case_event_id("triage", event_key)
+        prior = common.knowledge_find_case_transition(event_id, ticket_id)
+        if prior:
+            return str(prior["id"]), None, "attach_to_existing_run", "none"
+        replacing = None
         created_case_change = "initial"
         existing = common.knowledge_find_requested_run(ticket_id)
         if existing and existing.get("id"):
@@ -257,18 +254,16 @@ def _create_knowledge_run(ticket_id: int, triage: dict, *, environment: str = ""
             if investigation_decision == "operator_review":
                 _attach_decision_document(ticket_id, run_id, triage, decision=decision)
                 return run_id, None, investigation_decision, case_change
+            if case_change != "replace":
+                # Parallel/deeper investigations need explicit operator policy;
+                # keep evidence, but never silently create another current parent.
+                _attach_decision_document(ticket_id, run_id, triage, decision=decision)
+                return run_id, None, "operator_review", case_change
+            replacing = existing
             payload["runbook"] = _runbook_with_decision_delta(triage, decision)
             payload["summary"] = f"{triage.get('summary', '')} ({case_change})"
             created_case_change = case_change
-        try:
-            created = common.knowledge_create_run(payload)
-        except Exception:
-            # A timeout may occur after INSERT committed. The primary key also
-            # prevents duplicate creation by concurrent/retried requests.
-            prior = common.knowledge_find_run(payload["id"]) if event_key else None
-            if not prior or prior.get("ticket_id") != ticket_id or prior.get("task_type") != "investigation_case":
-                raise
-            created = {"run": prior}
+        created = common.knowledge_transition_case(payload, event_id, replacing)
         run = created.get("run") if isinstance(created, dict) else {}
         run_id = run.get("id") if isinstance(run, dict) else None
         return str(run_id) if run_id else None, None, "open_new_investigation", created_case_change

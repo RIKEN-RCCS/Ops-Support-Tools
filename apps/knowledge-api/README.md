@@ -379,3 +379,37 @@ POST /api/runs/{run_id}/execution-result
 ```
 
 Require the write token for the four POST endpoints. Keep the management web UI under `/knowledge/` and broad APIs such as `/api/search`, `/api/documents`, `/api/document-handoffs`, `/api/runs` list, generic run document creation, and internal `POST /api/runs/worker-claim` out of the real-machine gateway allowlist unless there is a separate operational reason.
+
+## Atomic parent-case transitions (local implementation; not deployed)
+
+`POST /api/cases/transitions` accepts an `event_id` UUID, `mode` (`create` or
+`replace`), `old_case_id`, `old_case_version`, and a `run` payload for one
+`investigation_case` in `routing_requested`. Create uses empty old-case fields;
+replace requires the ID and `case_version` returned by the current run API.
+
+A single SQLite transaction checks the current parent set, version, claims and
+child-task state, preserves old encrypted issue text, supersedes the old parent,
+inserts its successor, and records the event receipt. A failed insert rolls back
+all changes. Children, documents, links and handoffs remain with their original
+runs. Claimed parents, active children, stale versions and ambiguous parent sets
+are rejected without starting another investigation. Generic parent creation
+also rejects a second current case for the same ticket.
+
+A committed identical event returns its existing successor. Reusing an event
+with a different request conflicts. `GET /api/cases/transitions/<event_id>` allows
+clients to reconcile a lost response; clients do not blindly retry a POST. Both
+transition routes use the existing configured write-token policy. Receipt data
+is stored in `case_transition_requests`, created by schema initialization.
+
+This guarantees case-transition idempotency, not exactly-once Zendesk posting
+or all administrative status edits. Existing historical events have no receipt
+unless processed through this interface. Before any future deployment, back up
+the DB, coordinate the API and caller versions, and configure caller write-token
+access when the API's write-token policy is enabled. No credentials or runtime
+configuration are provisioned by this code change.
+
+Offline tests use synthetic SQLite databases and encryption keys:
+
+```sh
+PYTHONPATH=apps/knowledge-api python -m unittest discover -s apps/knowledge-api -p 'test_case_lifecycle.py'
+```
