@@ -24,6 +24,19 @@ from secret_config import env_secret
 
 app = Flask(__name__)
 
+@app.before_request
+def _reject_unsupported_diagnostic_methods():
+    if request.method in {"TRACE", "TRACK"}:
+        return jsonify({"error": "method_not_supported"}), 501
+
+
+@app.after_request
+def _add_response_security_headers(response):
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    return response
+
+
+
 MONITOR_QUEUES = ("incoming", "incoming_followup", "pending", "pending_followup", "done", "failed")
 SEND_INTERNAL_NOTE_MARKER = os.environ.get("SUPPORT_AI_SEND_INTERNAL_NOTE_MARKER", "[SEND_INTERNAL_NOTE]")
 INTERNAL_NOTE_SENT_TAG = os.environ.get("SUPPORT_AI_INTERNAL_NOTE_SENT_TAG", "internal_note_sent")
@@ -259,9 +272,6 @@ def enqueue_ticket(
     """ticket_id を incoming/ に冪等に積む。新規作成したら True。"""
     common.ensure_spool_dirs()
     name = f"ticket_{ticket_id}.json"
-    if common.queue_exists("incoming", name):
-        return False
-    target = common.spool_path("incoming") / name
     event = {
         "ticket_id": int(ticket_id),
         "received_at": int(time.time()),
@@ -270,8 +280,7 @@ def enqueue_ticket(
         "machine": machine,
         "support_area": support_area,
     }
-    common.atomic_write_json(target, event)
-    return True
+    return common.enqueue_if_absent("incoming", name, event)
 
 
 def enqueue_followup(
@@ -287,9 +296,6 @@ def enqueue_followup(
     name = f"ticket_{ticket_id}"
     if comment_id is not None:
         name += f"_comment_{comment_id}"
-    target = common.spool_path("incoming_followup") / f"{name}.json"
-    if common.queue_exists("incoming_followup", target.name):
-        return False
     event = {
         "ticket_id": int(ticket_id),
         "comment_id": int(comment_id) if comment_id is not None else None,
@@ -299,8 +305,7 @@ def enqueue_followup(
         "environment": environment,
         "machine": machine,
     }
-    common.atomic_write_json(target, event)
-    return True
+    return common.enqueue_if_absent("incoming_followup", f"{name}.json", event)
 
 
 @app.get("/healthz")

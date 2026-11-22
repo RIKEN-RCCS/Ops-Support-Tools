@@ -110,6 +110,11 @@ class _QueueConnection(sqlite3.Connection):
 
 
 def _queue_conn() -> sqlite3.Connection:
+    if os.environ.get("SUPPORT_AI_QUEUE_READONLY") == "1":
+        uri = QUEUE_DB.absolute().as_uri() + "?mode=ro"
+        conn = sqlite3.connect(uri, uri=True, factory=_QueueConnection)
+        conn.row_factory = sqlite3.Row
+        return conn
     QUEUE_DB.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(QUEUE_DB, factory=_QueueConnection)
     conn.row_factory = sqlite3.Row
@@ -131,6 +136,8 @@ def check_queue_writable() -> None:
 
 
 def _init_queue_db() -> None:
+    if os.environ.get("SUPPORT_AI_QUEUE_READONLY") == "1":
+        return
     with _queue_conn() as conn:
         conn.execute(
             """
@@ -165,6 +172,8 @@ def _decode_queue_payload(raw: str) -> Dict[str, Any]:
 def ensure_spool_dirs(base: Optional[Path] = None) -> Path:
     """レガシースプールの全サブディレクトリと SQLite キューを作成し、ベースパスを返す。"""
     base = Path(base) if base is not None else SPOOL_DIR
+    if os.environ.get("SUPPORT_AI_QUEUE_READONLY") == "1":
+        return base
     for sub in SPOOL_SUBDIRS:
         (base / sub).mkdir(parents=True, exist_ok=True)
     _init_queue_db()
@@ -211,6 +220,21 @@ def write_queue_item(queue: str, name: str, data: Dict[str, Any]) -> QueueItem:
             (queue, name, _encode_queue_payload(data), now, now),
         )
     return QueueItem(queue=queue, name=name)
+
+
+def enqueue_if_absent(queue: str, name: str, data: Dict[str, Any]) -> bool:
+    """Insert an incoming event once while the same key is still queued."""
+    if queue not in ("incoming", "incoming_followup"):
+        raise ValueError("invalid incoming queue")
+    _init_queue_db()
+    now = int(time.time())
+    with _queue_conn() as conn:
+        result = conn.execute(
+            """INSERT INTO queue_items (queue, name, payload_json, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?) ON CONFLICT(queue, name) DO NOTHING""",
+            (queue, name, _encode_queue_payload(data), now, now),
+        )
+        return result.rowcount == 1
 
 
 def update_queue_item(item: QueueItem, data: Dict[str, Any]) -> QueueItem:
