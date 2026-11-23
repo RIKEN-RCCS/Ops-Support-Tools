@@ -21,11 +21,12 @@ import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from ipaddress import ip_address
 from pathlib import Path
 from typing import Any
 
 import requests
-from flask import Flask, Response, jsonify, request
+from flask import Flask, Response, g, jsonify, request
 
 
 def log(message: str) -> None:
@@ -138,6 +139,49 @@ def env_list(name: str, default: list[str]) -> list[str]:
 
 
 @dataclass(frozen=True)
+class RelayClient:
+    token: bytes
+    source_ip: str
+    allowed: frozenset[str]
+
+
+def load_relay_clients(policy_file: str) -> dict[str, RelayClient]:
+    if not policy_file:
+        return {}
+    try:
+        entries = json.loads(Path(policy_file).read_text(encoding="utf-8"))
+        if not isinstance(entries, dict) or not entries:
+            raise ValueError
+        clients = {}
+        tokens = set()
+        for label, entry in entries.items():
+            if not re.fullmatch(r"[a-z][a-z0-9-]{0,31}", label) or label in {"legacy", "unattributed"}:
+                raise ValueError
+            token_file = Path(entry["token_file"])
+            token = token_file.read_bytes().strip()
+            operations = entry["allow"]
+            if (not token_file.is_absolute() or not re.fullmatch(rb"[A-Za-z0-9_-]{32,}", token)
+                    or token in tokens or not isinstance(operations, list)
+                    or any(not re.fullmatch(r"(?:GET|HEAD|POST|PUT|PATCH|DELETE) /api/v2/[a-z_:]+(?:/[a-z_:]+)*\.json", item)
+                           for item in operations)):
+                raise ValueError
+            source_ip = entry["source_ip"]
+            if not isinstance(source_ip, str):
+                raise ValueError
+            clients[label] = RelayClient(token, str(ip_address(source_ip)), frozenset(operations))
+            tokens.add(token)
+        return clients
+    except (OSError, KeyError, TypeError, ValueError):
+        raise ValueError("Invalid Fugaku relay clients configuration") from None
+
+
+def scope_path(path: str) -> str:
+    if re.fullmatch(r"/api/v2/job_statuses/[A-Za-z0-9_-]+\.json", path):
+        return "/api/v2/job_statuses/:id.json"
+    return re.sub(r"(?<=/)[0-9]+(?=/|\.json$)", ":id", path)
+
+
+@dataclass(frozen=True)
 class Config:
     zendesk_url: str
     client_identifier: str
@@ -152,6 +196,8 @@ class Config:
     default_tags: list[str]
     ticket_subject_prefix: str
     timeout: float
+    clients_file: str = ""
+    edge_token: str = ""
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -175,6 +221,8 @@ class Config:
             default_tags=env_list("ZENDESK_FUGAKU_DEFAULT_TAGS", []),
             ticket_subject_prefix=os.environ.get("ZENDESK_FUGAKU_TICKET_SUBJECT_PREFIX", ""),
             timeout=float(os.environ.get("ZENDESK_FUGAKU_HTTP_TIMEOUT", "30")),
+            clients_file=os.environ.get("ZENDESK_FUGAKU_CLIENTS_FILE", "").strip(),
+            edge_token=read_secret("ZENDESK_FUGAKU_EDGE_TOKEN"),
         )
 
     def validate(self) -> None:
@@ -185,7 +233,7 @@ class Config:
             missing.append("ZENDESK_FUGAKU_OAUTH_CLIENT_IDENTIFIER")
         if not self.client_secret:
             missing.append("ZENDESK_FUGAKU_OAUTH_CLIENT_SECRET or *_FILE")
-        if not self.relay_token:
+        if not self.relay_token and not self.clients_file:
             missing.append("ZENDESK_FUGAKU_RELAY_TOKEN or *_FILE")
         if missing:
             raise RuntimeError("missing config: " + ", ".join(missing))
@@ -217,9 +265,10 @@ class OAuthClient:
             },
             headers={"Content-Type": "application/json", "Accept": "application/json"},
             timeout=self.config.timeout,
+            allow_redirects=False,
         )
         if not response.ok:
-            raise RuntimeError(f"Zendesk OAuth refresh -> {response.status_code}: {response.text[:500]}")
+            raise RuntimeError(f"Zendesk OAuth refresh -> {response.status_code}")
         refreshed = normalize_bundle(response.json())
         merged = dict(bundle)
         merged.update(refreshed)
@@ -371,6 +420,7 @@ class ZendeskClient:
                 "Content-Type": "application/json",
             },
             timeout=self.config.timeout,
+            allow_redirects=False,
         )
         if response.status_code == 401:
             token = self.oauth.ensure_access_token(force=True)
@@ -384,9 +434,10 @@ class ZendeskClient:
                     "Content-Type": "application/json",
                 },
                 timeout=self.config.timeout,
+                allow_redirects=False,
             )
         if not response.ok:
-            raise RuntimeError(f"Zendesk {method} {path} -> {response.status_code}: {response.text[:500]}")
+            raise RuntimeError(f"Zendesk request -> {response.status_code}")
         if not response.content:
             return {}
         return response.json()
@@ -414,6 +465,7 @@ class ZendeskClient:
             data=body,
             headers=headers,
             timeout=self.config.timeout,
+            allow_redirects=False,
         )
         if response.status_code == 401:
             token = self.oauth.ensure_access_token(force=True)
@@ -425,6 +477,7 @@ class ZendeskClient:
                 data=body,
                 headers=headers,
                 timeout=self.config.timeout,
+                allow_redirects=False,
             )
         return response
 
@@ -479,9 +532,33 @@ class ZendeskClient:
 
 def build_app(config: Config) -> Flask:
     app = Flask(__name__)
+
+    @app.before_request
+    def reject_diagnostic_methods():
+        if request.method in {"TRACE", "TRACK"}:
+            return jsonify(ok=False, error="method_not_supported"), 501
+
+    @app.after_request
+    def security_headers(response):
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        return response
     oauth = OAuthClient(config)
     zendesk = ZendeskClient(config, oauth)
     store = EventStore(config.db_file)
+    clients = load_relay_clients(getattr(config, "clients_file", ""))
+    operator_token = config.relay_token.encode()
+    edge_token = getattr(config, "edge_token", "").encode()
+    if clients:
+        vendor_tokens = {entry.token for entry in clients.values()}
+        if (not re.fullmatch(rb"[A-Za-z0-9_-]{32,}", edge_token)
+                or edge_token == operator_token or vendor_tokens & {edge_token, operator_token}):
+            raise ValueError("Configure distinct Fugaku relay, client and edge credentials")
+
+    @app.after_request
+    def label_client(response: Response) -> Response:
+        if request.path.startswith("/api/v2/") and "relay_client" in g:
+            response.headers["X-Fugaku-Relay-Client"] = g.relay_client
+        return response
 
     def missing_config() -> list[str]:
         missing = []
@@ -491,26 +568,45 @@ def build_app(config: Config) -> Flask:
             missing.append("ZENDESK_FUGAKU_OAUTH_CLIENT_IDENTIFIER")
         if not config.client_secret:
             missing.append("ZENDESK_FUGAKU_OAUTH_CLIENT_SECRET or *_FILE")
-        if not config.relay_token:
+        if not operator_token and not clients:
             missing.append("ZENDESK_FUGAKU_RELAY_TOKEN or *_FILE")
         if not config.token_bundle_file.exists():
             missing.append("ZENDESK_FUGAKU_OAUTH_TOKEN_BUNDLE_FILE")
         return missing
 
-    def authorized() -> bool:
+    def supplied_token() -> bytes:
         header = request.headers.get("Authorization", "")
         token = ""
         if header.lower().startswith("bearer "):
             token = header.split(" ", 1)[1].strip()
         token = token or request.headers.get("X-Fugaku-Relay-Token", "").strip()
-        return bool(token) and hmac.compare_digest(token, config.relay_token)
+        return token.encode()
 
     def require_ready_and_authorized() -> Response | None:
+        if "relay_client" in g:
+            return None
         missing = missing_config()
         if missing:
             return jsonify({"ok": False, "error": "not configured", "missing_config": missing}), 503
-        if not authorized():
-            return jsonify({"ok": False, "error": "unauthorized"}), 401
+        token = supplied_token()
+        if clients:
+            for label, entry in clients.items():
+                if hmac.compare_digest(token, entry.token):
+                    proof = request.headers.get("X-Fugaku-Edge-Token", "").encode()
+                    if (not hmac.compare_digest(proof, edge_token)
+                            or request.headers.get("X-Fugaku-Source-IP") != entry.source_ip):
+                        return jsonify({"ok": False, "error": "source not allowed for this client"}), 403
+                    g.relay_client = label
+                    return None
+        elif operator_token and hmac.compare_digest(token, operator_token):
+            g.relay_client = "legacy"
+            return None
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+
+    @app.before_request
+    def authorize_scoped_api() -> Response | None:
+        if clients and request.path.startswith("/api/v2/"):
+            return require_ready_and_authorized()
         return None
 
     def proxy_event_id(prefix: str) -> str:
@@ -540,6 +636,10 @@ def build_app(config: Config) -> Flask:
         if guard is not None:
             return guard
         event_id = proxy_event_id(event_prefix)
+        if clients:
+            if f"{request.method} {scope_path(path)}" not in clients[g.relay_client].allowed:
+                return jsonify({"ok": False, "error": "API not allowed for this client"}), 403
+            event_id = f"{g.relay_client}:{event_id}"
         try:
             response = zendesk.raw_request(
                 method,
@@ -553,13 +653,14 @@ def build_app(config: Config) -> Flask:
                 source=event_prefix,
                 status="proxied" if response.ok else "failed",
                 zendesk_ticket_id=ticket_id,
-                error="" if response.ok else f"Zendesk {response.status_code}: {response.text[:300]}",
+                error="" if response.ok else f"Zendesk {response.status_code}",
             )
             return proxy_response(response)
         except Exception as exc:  # noqa: BLE001
-            store.record_proxy(event_id=event_id, source=event_prefix, status="failed", error=str(exc))
-            log(f"proxy failed source={event_prefix}: {exc}")
-            return jsonify({"ok": False, "error": str(exc)[:300]}), 502
+            error_type = type(exc).__name__
+            store.record_proxy(event_id=event_id, source=event_prefix, status="failed", error=error_type)
+            log(f"proxy failed source={event_prefix} type={error_type}")
+            return jsonify({"ok": False, "error": "upstream request failed"}), 502
 
     @app.get("/health")
     def health():
@@ -669,7 +770,7 @@ def build_app(config: Config) -> Flask:
     def recent_events():
         if not config.relay_token:
             return jsonify({"ok": False, "error": "not configured", "missing_config": missing_config()}), 503
-        if not authorized():
+        if not hmac.compare_digest(supplied_token(), operator_token):
             return jsonify({"ok": False, "error": "unauthorized"}), 401
         try:
             limit = int(request.args.get("limit", "50"))
@@ -690,7 +791,7 @@ def periodic_refresh(config: Config) -> None:
         try:
             oauth.ensure_access_token()
         except Exception as exc:  # noqa: BLE001
-            log(f"periodic OAuth refresh failed: {exc}")
+            log(f"periodic OAuth refresh failed type={type(exc).__name__}")
 
 
 def main() -> int:

@@ -243,3 +243,44 @@ The standalone [all-API test](tools/README.md) checks the requested read/write
 operations using uniquely marked test users/organizations, then deletes them.
 It reads the relay token from a file and requires no Python packages beyond
 the standard library. See that guide for execution, results, and cleanup-only retry.
+
+## Hardened runtime candidate
+
+For production WSGI, install the declared dependencies and run:
+
+```sh
+python -B -m gunicorn --config relay_wsgi.py 'relay_wsgi:application()'
+```
+
+The factory validates environment configuration and starts the existing locked
+OAuth refresh loop inside one worker. Four threads handle HTTP requests; graceful
+shutdown is bounded at 30 seconds. Access accounting stays at the trusted proxy
+rather than duplicating query strings in a second access log.
+
+Run as a dedicated non-root UID with a read-only root filesystem, no capabilities,
+`no-new-privileges`, a temporary `/tmp`, and only the service data directory writable.
+Mount policy and credentials individually read-only. Deployment paths, identities,
+proxy proofs and client policies belong in private configuration.
+
+Authenticated API and OAuth requests do not follow redirects. Persisted upstream
+errors include status or exception class only, never response bodies or exception
+messages. API error response bodies are still returned to the authorized caller.
+The client permissions and operator-only event inspection remain unchanged.
+An operator credential does not authorize business APIs when client policy is set;
+Guide administration and OAuth-management APIs are not relay routes. This does not
+reduce the Zendesk account's own OAuth permissions if the relay itself is compromised.
+
+Offline checks: `python -B -m unittest discover -s apps/zendesk_fugaku -p 'test_*.py'`.
+Use synthetic credentials and an isolated environment for lifecycle/restore checks.
+
+### Optional client policy
+
+Set `ZENDESK_FUGAKU_CLIENTS_FILE` to a JSON mapping of arbitrary client labels to
+`token_file` (absolute path), `source_ip` (one IP) and `allow` (method/path list).
+Use `:id` for dynamic IDs. The trusted proxy must overwrite `X-Fugaku-Source-IP`
+and `X-Fugaku-Edge-Token`; the latter must match `ZENDESK_FUGAKU_EDGE_TOKEN_FILE`.
+Use distinct credentials for each client, the proxy and the operator. Keep actual
+addresses, policy files and credentials outside the repository. Empty or invalid
+configured policies fail startup. Without a client policy, shared-token legacy
+mode remains available. With a client policy, the shared operator credential is
+reserved for `/events` and cannot call business APIs.
