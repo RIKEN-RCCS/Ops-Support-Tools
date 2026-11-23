@@ -97,3 +97,43 @@ docker compose up -d zendesk-rccs
 `apps/zendesk-support-ai` の Docker services は `ZENDESK_RELAY_URL=http://zendesk-rccs:8080` と `ZENDESK_RELAY_TOKEN_FILE=/run/secrets/zendesk_rccs_relay_token` を受け取り、この relay 経由で Zendesk API を使います。
 
 API token 認証用の `ZENDESK_KEY_FILE` は Compose の support-ai service には渡しません。
+
+## Optional client API restrictions
+
+Set `ZENDESK_RCCS_CLIENTS_FILE` to an absolute JSON file path to enable
+client-specific permissions. Missing, invalid or empty policy files fail startup.
+When enabled, the shared relay token is not accepted. When unset, existing shared
+relay authentication remains available for compatibility.
+
+Each JSON member is a client label and has `token_file` (an absolute path to a
+unique secret containing at least 32 ASCII letters, digits, underscores or
+hyphens) and `profile`. Never commit real policy files or tokens.
+
+| Profile | Allowed operations |
+| --- | --- |
+| `read` | Ticket/comments, agent directory, groups, search and current-user GET |
+| `internal-note` | Reads above; ticket PUT with explicit private comment and optional tags |
+| `triage` | Reads/private notes; allowlisted custom fields, assignees and groups |
+| `public-reply` | Current-user/ticket/comments GET; explicit public comment, tags and permitted status |
+| `audit` | Relay `/events` GET only |
+
+Assignment IDs use optional positive-integer arrays `custom_field_ids`,
+`assignee_ids` and `group_ids`; unspecified arrays grant no assignment permission.
+`public_statuses` defaults to `["pending"]`; allowed values are `new`, `open`,
+`pending`, `hold`. Solving/closing is excluded. Ticket creation, uploads,
+user/organization writes, deletion and PATCH/POST update aliases are excluded.
+JSON payloads reject unlisted fields, comment authors, attachments and implicit
+comment visibility. Pagination parameters and repeated `role[]` values are
+preserved. Scoped requests never follow upstream redirects.
+
+All routes check the incoming method/path before OAuth or forwarding. Audit
+identifiers are namespaced by client; they do not provide posting deduplication.
+Upstream exception bodies are not persisted in scoped error records. Network
+errors are not retried; an explicit upstream 401 retains the existing single
+OAuth refresh retry. This policy does not reduce the upstream OAuth account's
+permissions or limit reads/writes to a particular ticket. Possession of a public
+reply token grants that operation; it does not prove human approval.
+
+Run the offline regression with `python -B apps/zendesk_rccs/test_client_policy.py`
+from a checkout with the relay dependencies installed. It uses synthetic secrets,
+a temporary database and mocked HTTP only; it never contacts Zendesk.

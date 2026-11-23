@@ -24,7 +24,9 @@ from pathlib import Path
 from typing import Any
 
 import requests
-from flask import Flask, Response, jsonify, request
+from flask import Flask, Response, g, jsonify, request
+
+import client_policy
 
 
 def log(message: str) -> None:
@@ -151,6 +153,7 @@ class Config:
     default_tags: list[str]
     ticket_subject_prefix: str
     timeout: float
+    clients_file: str = ""
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -174,6 +177,7 @@ class Config:
             default_tags=env_list("ZENDESK_RCCS_DEFAULT_TAGS", ["support_ai_relay"]),
             ticket_subject_prefix=os.environ.get("ZENDESK_RCCS_TICKET_SUBJECT_PREFIX", "[Support AI]"),
             timeout=float(os.environ.get("ZENDESK_RCCS_HTTP_TIMEOUT", "30")),
+            clients_file=os.environ.get("ZENDESK_RCCS_CLIENTS_FILE", "").strip(),
         )
 
     def validate(self) -> None:
@@ -184,7 +188,7 @@ class Config:
             missing.append("ZENDESK_RCCS_OAUTH_CLIENT_IDENTIFIER")
         if not self.client_secret:
             missing.append("ZENDESK_RCCS_OAUTH_CLIENT_SECRET or *_FILE")
-        if not self.relay_token:
+        if not self.relay_token and not self.clients_file:
             missing.append("ZENDESK_RCCS_RELAY_TOKEN or *_FILE")
         if missing:
             raise RuntimeError("missing config: " + ", ".join(missing))
@@ -413,6 +417,7 @@ class ZendeskClient:
             data=body,
             headers=headers,
             timeout=self.config.timeout,
+            allow_redirects=not bool(self.config.clients_file),
         )
         if response.status_code == 401:
             token = self.oauth.ensure_access_token(force=True)
@@ -424,6 +429,7 @@ class ZendeskClient:
                 data=body,
                 headers=headers,
                 timeout=self.config.timeout,
+                allow_redirects=not bool(self.config.clients_file),
             )
         return response
 
@@ -478,6 +484,32 @@ class ZendeskClient:
 
 def build_app(config: Config) -> Flask:
     app = Flask(__name__)
+    @app.before_request
+    def reject_diagnostic_methods():
+        if request.method in {"TRACE", "TRACK"}:
+            return jsonify(error="method_not_supported"), 501
+
+    @app.after_request
+    def response_security_headers(response):
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        return response
+
+    clients = client_policy.load_clients(config.clients_file)
+
+    @app.before_request
+    def enforce_client_policy():
+        if not config.clients_file or not (request.path.startswith("/api/v2/") or request.path == "/events"):
+            return None
+        header = request.headers.get("Authorization", "")
+        token = header[7:].strip() if header.lower().startswith("bearer ") else ""
+        token = token or request.headers.get("X-R-CCS-Relay-Token", "").strip()
+        label, client = client_policy.authenticate(clients, token.encode("utf-8"))
+        if client is None:
+            return jsonify(ok=False, error="unauthorized"), 401
+        g.relay_client = label
+        if not client_policy.allowed(client, request.method, request.path, request.args, request.get_json(silent=True)):
+            return jsonify(ok=False, error="forbidden"), 403
+        return None
     oauth = OAuthClient(config)
     zendesk = ZendeskClient(config, oauth)
     store = EventStore(config.db_file)
@@ -490,13 +522,15 @@ def build_app(config: Config) -> Flask:
             missing.append("ZENDESK_RCCS_OAUTH_CLIENT_IDENTIFIER")
         if not config.client_secret:
             missing.append("ZENDESK_RCCS_OAUTH_CLIENT_SECRET or *_FILE")
-        if not config.relay_token:
+        if not config.relay_token and not config.clients_file:
             missing.append("ZENDESK_RCCS_RELAY_TOKEN or *_FILE")
         if not config.token_bundle_file.exists():
             missing.append("ZENDESK_RCCS_OAUTH_TOKEN_BUNDLE_FILE")
         return missing
 
     def authorized() -> bool:
+        if config.clients_file:
+            return bool(getattr(g, "relay_client", None))
         header = request.headers.get("Authorization", "")
         token = ""
         if header.lower().startswith("bearer "):
@@ -519,7 +553,8 @@ def build_app(config: Config) -> Flask:
             or request.headers.get("X-Event-Id")
             or ""
         ).strip()
-        return supplied or f"{prefix}-{uuid.uuid4()}"
+        identifier = supplied or f"{prefix}-{uuid.uuid4()}"
+        return f"{g.relay_client}:{identifier}" if config.clients_file else identifier
 
     def proxy_response(response: requests.Response) -> Response:
         content_type = response.headers.get("Content-Type", "application/octet-stream")
@@ -552,10 +587,12 @@ def build_app(config: Config) -> Flask:
                 source=event_prefix,
                 status="proxied" if response.ok else "failed",
                 zendesk_ticket_id=ticket_id,
-                error="" if response.ok else f"Zendesk {response.status_code}: {response.text[:300]}",
+                error="" if response.ok else (f"Zendesk {response.status_code}" if config.clients_file else f"Zendesk {response.status_code}: {response.text[:300]}"),
             )
             return proxy_response(response)
         except Exception as exc:  # noqa: BLE001
+            if config.clients_file:
+                exc = RuntimeError("upstream request failed")
             store.record_proxy(event_id=event_id, source=event_prefix, status="failed", error=str(exc))
             log(f"proxy failed source={event_prefix}: {exc}")
             return jsonify({"ok": False, "error": str(exc)[:300]}), 502
@@ -577,7 +614,7 @@ def build_app(config: Config) -> Flask:
             "GET",
             "/api/v2/search.json",
             event_prefix="search",
-            params={"query": query},
+            params=list(request.args.items(multi=True)),
         )
 
     @app.get("/api/v2/organizations/search.json")
@@ -633,14 +670,14 @@ def build_app(config: Config) -> Flask:
             method,
             path,
             event_prefix="api_proxy",
-            params=request.args.to_dict(flat=True) if request.args else None,
+            params=list(request.args.items(multi=True)) if request.args else None,
             body=request.get_data() if method in {"POST", "PUT", "PATCH", "DELETE"} else None,
             content_type=request.headers.get("Content-Type", "application/json"),
         )
 
     @app.get("/events")
     def recent_events():
-        if not config.relay_token:
+        if not config.relay_token and not config.clients_file:
             return jsonify({"ok": False, "error": "not configured", "missing_config": missing_config()}), 503
         if not authorized():
             return jsonify({"ok": False, "error": "unauthorized"}), 401
