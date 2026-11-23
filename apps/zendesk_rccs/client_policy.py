@@ -122,12 +122,15 @@ def update_allowed(client, payload):
             return False
         seen = set()
         for field in fields:
+            field_id = field.get("id") if isinstance(field, dict) else None
+            if isinstance(field_id, str) and re.fullmatch(r"[1-9][0-9]{0,19}", field_id):
+                field_id = int(field_id)
             if (not isinstance(field, dict) or set(field) != {"id", "value"}
-                    or type(field["id"]) is not int or field["id"] not in client.custom_field_ids
-                    or field["id"] in seen or type(field["value"]) is not int
+                    or type(field_id) is not int or field_id not in client.custom_field_ids
+                    or field_id in seen or type(field["value"]) is not int
                     or field["value"] not in client.assignee_ids):
                 return False
-            seen.add(field["id"])
+            seen.add(field_id)
     return True
 
 

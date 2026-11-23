@@ -47,6 +47,8 @@ class ClientPolicyTest(unittest.TestCase):
             check(profile,'PUT','/api/v2/tickets/42.json',200 if profile=='triage' else 403,{'ticket':{field:value}})
           for payload in [{'ticket':{'assignee_id':999}},{'ticket':{'assignee_id':True}},{'ticket':{'custom_fields':[{'id':999,'value':456}]}},{'ticket':{'comment':{'body':'x','public':False,'author_id':456}}},{'ticket':{'status':'solved'}},{'ticket':{'subject':'x'}},{'ticket':{'comment':{'body':'x','public':'false'}}}]:
            check('triage','PUT','/api/v2/tickets/42.json',403,payload)
+          for field_id, expected in [('123', 200), ('999', 403), ('123.0', 403)]:
+           check('triage','PUT','/api/v2/tickets/42.json',expected,{'ticket':{'custom_fields':[{'id':field_id,'value':456}]}})
           check('public-reply','PUT','/api/v2/tickets/42.json',200,{'ticket':{'comment':{'body':'synthetic','public':True},'status':'pending'}})
           check(config.relay_token,'GET','/api/v2/users/me.json',401)
           check('incorrect','GET','/api/v2/users/me.json',401)
@@ -96,7 +98,7 @@ class ClientPolicyTest(unittest.TestCase):
           else:raise AssertionError('empty policy accepted')
           legacy=relay.build_app(dataclasses.replace(config,clients_file='',db_file=p/'legacy.sqlite')).test_client()
           assert legacy.get('/api/v2/users/me.json',headers={'Authorization':'Bearer '+config.relay_token}).status_code==200;count+=1
-         self.assertEqual(count, 138)
+         self.assertEqual(count, 141)
 
 
 if __name__ == "__main__":
