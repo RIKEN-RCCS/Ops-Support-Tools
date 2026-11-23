@@ -595,3 +595,17 @@ The API and callers must be deployed together after separate approval. The
 caller reads `KNOWLEDGE_API_WRITE_TOKEN` or its `_FILE` variant when configured;
 that access must match the API's existing write-token policy. This local change
 does not copy credentials, alter settings, build images, or deploy services.
+
+### Research-only startup candidate
+
+`research_startup.py COMMAND ...` checks the Knowledge endpoint using
+`SUPPORT_AI_KNOWLEDGE_TOKEN_FILE`, then starts a research worker without queue
+initialization, agent synchronization or Zendesk startup calls. Common Knowledge
+requests carry that individual credential and do not follow redirects. An empty
+configured credential fails rather than falling back to an operator token.
+
+Run research roles under separate non-root UIDs with read-only code, only their
+own client/LLM credentials and an optional read-only site policy. They do not need
+the shared queue, queue key, webhook token or writable agent configuration. Only
+roles actually reading tickets need a narrowly scoped relay credential. This
+startup mode is not for the triage/posting workers that still own the queue.

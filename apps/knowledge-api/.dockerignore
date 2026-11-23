@@ -1,0 +1,12 @@
+.git
+__pycache__
+*.pyc
+.env
+.env.*
+secrets/
+data/
+spool/
+*.sqlite
+*.sqlite3
+*.db
+*.log

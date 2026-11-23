@@ -1,2 +1,4 @@
 Flask>=3.0,<4
-cryptography>=42,<46
+cryptography>=50.0.0,<51
+
+gunicorn==27.0.0

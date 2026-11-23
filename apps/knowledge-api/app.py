@@ -17,12 +17,15 @@ from flask import Flask, jsonify, redirect, render_template_string, request, url
 
 import field_crypto
 import case_lifecycle
+import access_policy
 
 DB_PATH = Path(os.environ.get("KNOWLEDGE_DB", "/data/db.sqlite"))
 WRITE_TOKEN_FILE = os.environ.get("KNOWLEDGE_API_WRITE_TOKEN_FILE", "")
 WRITE_TOKEN = os.environ.get("KNOWLEDGE_API_WRITE_TOKEN", "")
 
 app = Flask(__name__)
+READONLY = os.environ.get("KNOWLEDGE_DB_READONLY") == "1"
+access_policy.install(app, os.environ.get("KNOWLEDGE_CLIENTS_FILE", ""), READONLY)
 
 RUN_STATUS_HELP = (
     "routing_requested=調査要求の分解待ち、routing=調査分解中、"
@@ -310,6 +313,10 @@ def _now() -> int:
 
 
 def _connect() -> sqlite3.Connection:
+    if READONLY:
+        conn = sqlite3.connect(DB_PATH.absolute().as_uri() + "?mode=ro&immutable=1", uri=True)
+        conn.row_factory = sqlite3.Row
+        return conn
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -319,6 +326,10 @@ def _connect() -> sqlite3.Connection:
 
 
 def _init_db() -> None:
+    if READONLY:
+        if not DB_PATH.is_file():
+            raise RuntimeError("Knowledge view snapshot unavailable")
+        return
     with _connect() as conn:
         conn.execute(case_lifecycle.SCHEMA)
         conn.executescript(
@@ -449,6 +460,11 @@ def _write_token() -> str:
 
 
 def _require_write_token() -> None:
+    if app.config.get("KNOWLEDGE_SCOPED_AUTH"):
+        from flask import g
+        if getattr(g, "knowledge_client", None):
+            return
+        raise PermissionError("valid bearer token is required")
     expected = _write_token()
     if not expected:
         return

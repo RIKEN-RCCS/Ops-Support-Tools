@@ -10,3 +10,10 @@ spool/
 secrets/
 data/
 config/
+.git
+__pycache__
+*.pyc
+*.sqlite
+*.sqlite3
+*.db
+*.log

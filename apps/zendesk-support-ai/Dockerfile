@@ -10,7 +10,8 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY . .
+COPY --chmod=0644 *.py ./
+COPY --chmod=0644 agents.example.json README.md ./
 
 RUN mkdir -p /data/queue /config && \
     cp /app/agents.example.json /config/agents.json && \

@@ -989,6 +989,16 @@ def knowledge_enabled() -> bool:
     return bool(KNOWLEDGE_API_URL)
 
 
+def _knowledge_headers(headers):
+    result = dict(headers)
+    token = env_secret("SUPPORT_AI_KNOWLEDGE_TOKEN")
+    if os.environ.get("SUPPORT_AI_KNOWLEDGE_TOKEN_FILE") and not token:
+        raise RuntimeError("Knowledge client credential unavailable")
+    if token:
+        result["Authorization"] = "Bearer " + token
+    return result
+
+
 def knowledge_create_run(payload: Dict[str, Any]) -> Dict[str, Any]:
     """Knowledge API に run request を作成する。
 
@@ -999,11 +1009,11 @@ def knowledge_create_run(payload: Dict[str, Any]) -> Dict[str, Any]:
     resp = requests.post(
         KNOWLEDGE_API_URL + "/api/runs",
         json=payload,
-        headers={"Content-Type": "application/json", "Accept": "application/json"},
-        timeout=HTTP_TIMEOUT,
+        headers=_knowledge_headers({"Content-Type": "application/json", "Accept": "application/json"}),
+        timeout=HTTP_TIMEOUT, allow_redirects=False,
     )
     if not resp.ok:
-        raise RuntimeError(f"Knowledge API POST /api/runs -> {resp.status_code}: {resp.text[:500]}")
+        raise RuntimeError(f"Knowledge API POST /api/runs -> {resp.status_code}")
     return resp.json()
 
 
@@ -1030,11 +1040,11 @@ def knowledge_list_runs(
     resp = requests.get(
         KNOWLEDGE_API_URL + "/api/runs",
         params=params,
-        headers={"Accept": "application/json"},
-        timeout=HTTP_TIMEOUT,
+        headers=_knowledge_headers({"Accept": "application/json"}),
+        timeout=HTTP_TIMEOUT, allow_redirects=False,
     )
     if not resp.ok:
-        raise RuntimeError(f"Knowledge API GET /api/runs -> {resp.status_code}: {resp.text[:500]}")
+        raise RuntimeError(f"Knowledge API GET /api/runs -> {resp.status_code}")
     data = resp.json()
     runs = data.get("runs") if isinstance(data, dict) else []
     return runs if isinstance(runs, list) else []
@@ -1069,13 +1079,13 @@ def knowledge_worker_claim_run(
     resp = requests.post(
         KNOWLEDGE_API_URL + "/api/runs/worker-claim",
         json=payload,
-        headers={"Content-Type": "application/json", "Accept": "application/json"},
-        timeout=HTTP_TIMEOUT,
+        headers=_knowledge_headers({"Content-Type": "application/json", "Accept": "application/json"}),
+        timeout=HTTP_TIMEOUT, allow_redirects=False,
     )
     if resp.status_code == 404:
         return None
     if not resp.ok:
-        raise RuntimeError(f"Knowledge API POST /api/runs/worker-claim -> {resp.status_code}: {resp.text[:500]}")
+        raise RuntimeError(f"Knowledge API POST /api/runs/worker-claim -> {resp.status_code}")
     data = resp.json()
     run = data.get("run") if isinstance(data, dict) else None
     if not isinstance(run, dict):
@@ -1091,6 +1101,8 @@ def knowledge_case_event_id(source: str, event_key: str) -> str:
 
 def _case_transition_headers() -> dict[str, str]:
     headers = {"Accept": "application/json", "Content-Type": "application/json"}
+    if os.environ.get("SUPPORT_AI_KNOWLEDGE_TOKEN_FILE") or os.environ.get("SUPPORT_AI_KNOWLEDGE_TOKEN"):
+        return _knowledge_headers(headers)
     token = env_secret("KNOWLEDGE_API_WRITE_TOKEN")
     if token:
         headers["Authorization"] = "Bearer " + token
@@ -1099,7 +1111,7 @@ def _case_transition_headers() -> dict[str, str]:
 
 def knowledge_find_case_transition(event_id: str, ticket_id: int) -> Optional[Dict[str, Any]]:
     response = requests.get(KNOWLEDGE_API_URL + "/api/cases/transitions/" + event_id,
-        headers=_case_transition_headers(), timeout=HTTP_TIMEOUT, allow_redirects=False)
+        headers=_knowledge_headers(_case_transition_headers()), timeout=HTTP_TIMEOUT, allow_redirects=False)
     if response.status_code == 404:
         return None
     if response.status_code != 200:
@@ -1121,7 +1133,7 @@ def knowledge_transition_case(payload: Dict[str, Any], event_id: str,
         run={k:v for k,v in payload.items() if k != "id"})
     try:
         response = requests.post(KNOWLEDGE_API_URL + "/api/cases/transitions", json=request,
-            headers=_case_transition_headers(), timeout=HTTP_TIMEOUT, allow_redirects=False)
+            headers=_knowledge_headers(_case_transition_headers()), timeout=HTTP_TIMEOUT, allow_redirects=False)
     except requests.RequestException:
         # Read the receipt, never retry a possibly committed POST.
         try:
@@ -1154,7 +1166,7 @@ def knowledge_find_requested_run(ticket_id: int) -> Optional[Dict[str, Any]]:
 
 def knowledge_find_run(run_id: str) -> Optional[Dict[str, Any]]:
     resp = requests.get(KNOWLEDGE_API_URL + f"/api/runs/{run_id}",
-                        headers={"Accept": "application/json"}, timeout=HTTP_TIMEOUT)
+                        headers=_knowledge_headers({"Accept": "application/json"}), timeout=HTTP_TIMEOUT, allow_redirects=False)
     if resp.status_code == 404:
         return None
     resp.raise_for_status()
@@ -1167,11 +1179,11 @@ def knowledge_get_run(run_id: str) -> Dict[str, Any]:
         raise RuntimeError("SUPPORT_AI_KNOWLEDGE_API_URL が未設定です")
     resp = requests.get(
         KNOWLEDGE_API_URL + f"/api/runs/{run_id}",
-        headers={"Accept": "application/json"},
-        timeout=HTTP_TIMEOUT,
+        headers=_knowledge_headers({"Accept": "application/json"}),
+        timeout=HTTP_TIMEOUT, allow_redirects=False,
     )
     if not resp.ok:
-        raise RuntimeError(f"Knowledge API GET /api/runs/{run_id} -> {resp.status_code}: {resp.text[:500]}")
+        raise RuntimeError(f"Knowledge API GET /api/runs/{run_id} -> {resp.status_code}")
     data = resp.json()
     run = data.get("run") if isinstance(data, dict) else None
     if not isinstance(run, dict):
@@ -1186,11 +1198,11 @@ def knowledge_update_run(run_id: str, payload: Dict[str, Any]) -> Dict[str, Any]
     resp = requests.patch(
         KNOWLEDGE_API_URL + f"/api/runs/{run_id}",
         json=payload,
-        headers={"Content-Type": "application/json", "Accept": "application/json"},
-        timeout=HTTP_TIMEOUT,
+        headers=_knowledge_headers({"Content-Type": "application/json", "Accept": "application/json"}),
+        timeout=HTTP_TIMEOUT, allow_redirects=False,
     )
     if not resp.ok:
-        raise RuntimeError(f"Knowledge API PATCH /api/runs/{run_id} -> {resp.status_code}: {resp.text[:500]}")
+        raise RuntimeError(f"Knowledge API PATCH /api/runs/{run_id} -> {resp.status_code}")
     data = resp.json()
     run = data.get("run") if isinstance(data, dict) else None
     if not isinstance(run, dict):
@@ -1205,11 +1217,11 @@ def knowledge_attach_run_document(run_id: str, payload: Dict[str, Any]) -> Dict[
     resp = requests.post(
         KNOWLEDGE_API_URL + f"/api/runs/{run_id}/documents",
         json=payload,
-        headers={"Content-Type": "application/json", "Accept": "application/json"},
-        timeout=HTTP_TIMEOUT,
+        headers=_knowledge_headers({"Content-Type": "application/json", "Accept": "application/json"}),
+        timeout=HTTP_TIMEOUT, allow_redirects=False,
     )
     if not resp.ok:
-        raise RuntimeError(f"Knowledge API POST /api/runs/{run_id}/documents -> {resp.status_code}: {resp.text[:500]}")
+        raise RuntimeError(f"Knowledge API POST /api/runs/{run_id}/documents -> {resp.status_code}")
     return resp.json()
 
 
@@ -1220,11 +1232,11 @@ def knowledge_list_run_documents(run_id: str, *, include_body: bool = False) -> 
     resp = requests.get(
         KNOWLEDGE_API_URL + f"/api/runs/{run_id}/documents",
         params={"include_body": "1" if include_body else "0"},
-        headers={"Accept": "application/json"},
-        timeout=HTTP_TIMEOUT,
+        headers=_knowledge_headers({"Accept": "application/json"}),
+        timeout=HTTP_TIMEOUT, allow_redirects=False,
     )
     if not resp.ok:
-        raise RuntimeError(f"Knowledge API GET /api/runs/{run_id}/documents -> {resp.status_code}: {resp.text[:500]}")
+        raise RuntimeError(f"Knowledge API GET /api/runs/{run_id}/documents -> {resp.status_code}")
     data = resp.json()
     documents = data.get("documents") if isinstance(data, dict) else []
     return documents if isinstance(documents, list) else []
@@ -1237,11 +1249,11 @@ def knowledge_search_documents(query: str, *, limit: int = 20) -> List[Dict[str,
     resp = requests.get(
         KNOWLEDGE_API_URL + "/api/search",
         params={"q": query, "limit": int(limit)},
-        headers={"Accept": "application/json"},
-        timeout=HTTP_TIMEOUT,
+        headers=_knowledge_headers({"Accept": "application/json"}),
+        timeout=HTTP_TIMEOUT, allow_redirects=False,
     )
     if not resp.ok:
-        raise RuntimeError(f"Knowledge API GET /api/search -> {resp.status_code}: {resp.text[:500]}")
+        raise RuntimeError(f"Knowledge API GET /api/search -> {resp.status_code}")
     data = resp.json()
     documents = data.get("documents") if isinstance(data, dict) else []
     return documents if isinstance(documents, list) else []
@@ -1253,11 +1265,11 @@ def knowledge_get_document(doc_id: str) -> Dict[str, Any]:
         raise RuntimeError("SUPPORT_AI_KNOWLEDGE_API_URL が未設定です")
     resp = requests.get(
         KNOWLEDGE_API_URL + f"/api/documents/{doc_id}",
-        headers={"Accept": "application/json"},
-        timeout=HTTP_TIMEOUT,
+        headers=_knowledge_headers({"Accept": "application/json"}),
+        timeout=HTTP_TIMEOUT, allow_redirects=False,
     )
     if not resp.ok:
-        raise RuntimeError(f"Knowledge API GET /api/documents/{doc_id} -> {resp.status_code}: {resp.text[:500]}")
+        raise RuntimeError(f"Knowledge API GET /api/documents/{doc_id} -> {resp.status_code}")
     data = resp.json()
     document = data.get("document") if isinstance(data, dict) else None
     if not isinstance(document, dict):

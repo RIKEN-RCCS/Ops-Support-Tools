@@ -413,3 +413,33 @@ Offline tests use synthetic SQLite databases and encryption keys:
 ```sh
 PYTHONPATH=apps/knowledge-api python -m unittest discover -s apps/knowledge-api -p 'test_case_lifecycle.py'
 ```
+
+## Optional isolated runtime
+
+`KNOWLEDGE_CLIENTS_FILE` enables client credentials with `reader`, `triage`,
+`worker`, `executor`, or `operator` profiles. The JSON maps arbitrary labels to
+absolute `token_file` paths and a `profile`; workers also specify their exact
+`worker` name (the host suffix is not part of that name). Invalid configured
+policies fail startup. All API requests require a credential; health remains
+available. The legacy write token does not bypass a configured policy.
+
+Workers can claim only their own worker type and cannot enter execution/result
+or browser management routes. Research record updates remain trusted operations;
+this is not per-record ownership isolation. Triage uses atomic case transitions.
+Keep all real policies and credentials outside this repository.
+
+For a read-only UI, publish a SQLite backup with `view_snapshot.publish` using
+an independent view encryption key. Encrypted fields are re-encrypted and claim
+capabilities removed; unsupported legacy file documents stop publication.
+Failed publication preserves the previous snapshot. The viewer sets
+`KNOWLEDGE_DB_READONLY=1`, uses only the view database/key and serves no API or
+write routes. It returns 503 for snapshots older than 120 seconds or dated in
+the future. Deploy it without networking, behind a trusted Unix-socket proxy.
+The viewer intentionally sees the same permitted Knowledge content; it has no
+original DB/key or backend credential.
+
+`knowledge_wsgi:application()` is the WSGI factory. Set `KNOWLEDGE_VIEW_DB` and
+`KNOWLEDGE_VIEW_KEY_FILE` only on the trusted backend to publish every 30 seconds.
+Existing authenticated operator forms must be routed to that backend separately;
+do not give the operator credential to the view service. Configure proxy access
+rules and operator authorization privately before enabling this layout.
